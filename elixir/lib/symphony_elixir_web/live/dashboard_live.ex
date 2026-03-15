@@ -12,7 +12,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
-  alias SymphonyElixir.{EventBus, PreviewManager}
+  alias SymphonyElixir.EventBus
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
 
   @runtime_tick_ms 1_000

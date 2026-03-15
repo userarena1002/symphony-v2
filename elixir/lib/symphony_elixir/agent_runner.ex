@@ -10,7 +10,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
 
-  alias SymphonyElixir.{Config, EventBus, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, EventBus, Linear.Issue, PromptBuilder, Workspace}
   alias SymphonyElixir.ExecutionBackend.HeadlessCLI
 
   @type worker_host :: String.t() | nil
