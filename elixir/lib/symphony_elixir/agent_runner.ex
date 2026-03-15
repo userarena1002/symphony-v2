@@ -10,7 +10,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
 
-  alias SymphonyElixir.{Config, EventBus, Linear.Issue, PromptBuilder, Workspace}
+  alias SymphonyElixir.{Config, EventBus, Linear.Issue, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.ExecutionBackend.HeadlessCLI
 
   @type worker_host :: String.t() | nil
@@ -84,6 +84,16 @@ defmodule SymphonyElixir.AgentRunner do
     case HeadlessCLI.run_session(workspace, prompt, cli_opts) do
       {:ok, result} ->
         Logger.info("Agent session completed for #{issue_context(issue)} session_id=#{result[:session_id]}")
+
+        # Move issue to Human Review so the orchestrator stops redispatching
+        case Tracker.update_issue_state(issue.id, "Human Review") do
+          :ok ->
+            Logger.info("Moved #{issue_context(issue)} to Human Review")
+
+          {:error, reason} ->
+            Logger.warning("Failed to move #{issue_context(issue)} to Human Review: #{inspect(reason)}")
+        end
+
         :ok
 
       {:error, reason} ->
