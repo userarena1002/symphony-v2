@@ -22,6 +22,8 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
     ResultMessage
   }
 
+  alias ClaudeCode.Content.{TextBlock, ToolUseBlock, ToolResultBlock}
+
   @doc """
   Start a new agent session and run it to completion, emitting events in real-time.
 
@@ -70,7 +72,15 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
           new_sid = sid || extract_session_id(msg)
 
           # Convert SDK message to Symphony events and emit in real-time
-          for event <- message_to_events(msg) do
+          events = message_to_events(msg)
+
+          # Debug: log message types that produce no events
+          if events == [] do
+            File.write!("/tmp/symphony-debug.log",
+              "NO_EVENTS: #{msg.__struct__ |> to_string() |> String.split(".") |> List.last()}\n", [:append])
+          end
+
+          for event <- events do
             on_event.(%{event | session_id: new_sid})
           end
 
@@ -99,49 +109,55 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
   #   UserMessage — tool results
   #   ResultMessage — session complete
 
-  # Partial messages: real-time streaming content
-  defp message_to_events(%PartialAssistantMessage{event: event} = msg) do
-    case event do
-      %{"type" => "content_block_start", "content_block" => %{"type" => "tool_use", "name" => name}} ->
-        [Event.tool_use(name, %{}, nil)]
+  # -- Partial messages: real-time streaming content --
 
-      %{"type" => "content_block_start", "content_block" => %{"type" => "text", "text" => text}} when text != "" ->
+  defp message_to_events(%PartialAssistantMessage{event: event} = _msg) do
+    case event do
+      %{type: :content_block_start, content_block: %{type: :tool_use, name: name}} ->
+        [Event.tool_use(name, %{})]
+
+      %{type: :content_block_start, content_block: %{type: :text, text: text}} when text != "" ->
         [Event.assistant(text)]
+
+      %{type: :content_block_delta, delta: %{type: :text_delta, text: text}} when is_binary(text) and text != "" ->
+        [Event.assistant(text)]
+
+      # Also handle string-key variants
+      %{"type" => "content_block_start", "content_block" => %{"type" => "tool_use", "name" => name}} ->
+        [Event.tool_use(name, %{})]
 
       %{"type" => "content_block_delta", "delta" => %{"type" => "text_delta", "text" => text}} when is_binary(text) and text != "" ->
         [Event.assistant(text)]
-
-      %{"type" => "content_block_delta", "delta" => %{"type" => "input_json_delta", "partial_json" => _json}} ->
-        # Tool input streaming — skip to avoid noise, the full input comes with AssistantMessage
-        []
 
       _ ->
         []
     end
   end
 
-  # Tool progress: shows which tool is running and how long
-  defp message_to_events(%ToolProgressMessage{tool_name: name, tool_use_id: id} = _msg) do
-    [%Event{
-      type: :tool_use,
-      content: %{tool: name || "tool", input: %{}, tool_use_id: id, progress: true},
-      raw: nil,
-      timestamp: DateTime.utc_now()
-    }]
+  # -- Tool progress --
+  defp message_to_events(%ToolProgressMessage{tool_name: name} = _msg) do
+    [Event.tool_use(name || "tool", %{})]
   end
 
-  # Tool summary: what the tool accomplished
+  # -- Tool summary --
   defp message_to_events(%ToolUseSummaryMessage{summary: summary} = _msg) when is_binary(summary) do
     [Event.tool_result("tool", String.slice(summary, 0, 500), true)]
   end
 
-  # Complete assistant message: full turn with all content blocks
-  defp message_to_events(%AssistantMessage{message: %{"content" => content}}) when is_list(content) do
+  # -- Complete assistant message (uses parsed Content structs) --
+  defp message_to_events(%AssistantMessage{message: %{content: content}}) when is_list(content) do
     Enum.flat_map(content, fn
-      %{"type" => "text", "text" => text} when is_binary(text) and text != "" ->
+      %TextBlock{text: text} when is_binary(text) and text != "" ->
         [Event.assistant(text)]
 
-      %{"type" => "tool_use", "name" => name, "input" => input} ->
+      %ToolUseBlock{name: name, input: input} ->
+        [Event.tool_use(name, input || %{})]
+
+      # Fallback for map content
+      %{type: :text, text: text} when is_binary(text) and text != "" ->
+        [Event.assistant(text)]
+
+      %{type: :tool_use, name: name, input: input} ->
         [Event.tool_use(name, input || %{})]
 
       _ ->
@@ -149,16 +165,15 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
     end)
   end
 
-  # User message with file result
-  defp message_to_events(%UserMessage{tool_use_result: %{"file" => file}}) when is_map(file) do
-    path = Map.get(file, "filePath", "")
-    [Event.tool_result("Read", path, true)]
-  end
-
-  # User message with tool results
-  defp message_to_events(%UserMessage{message: %{"content" => content}}) when is_list(content) do
+  # -- User message (tool results) --
+  defp message_to_events(%UserMessage{message: %{content: content}}) when is_list(content) do
     Enum.flat_map(content, fn
-      %{"type" => "tool_result", "content" => text} when is_binary(text) ->
+      %ToolResultBlock{content: result_content, is_error: is_error} ->
+        text = extract_result_text(result_content)
+        [Event.tool_result("tool", String.slice(text, 0, 500), !is_error)]
+
+      %{type: :tool_result, content: result_content} ->
+        text = extract_result_text(result_content)
         [Event.tool_result("tool", String.slice(text, 0, 500), true)]
 
       _ ->
@@ -166,7 +181,25 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
     end)
   end
 
-  # Result message: session complete
+  # User message with tool_use_result (file read shortcut)
+  defp message_to_events(%UserMessage{tool_use_result: result}) when is_map(result) do
+    file = Map.get(result, "file") || Map.get(result, :file, %{})
+    path = Map.get(file, "filePath") || Map.get(file, :filePath, "")
+    num_lines = Map.get(file, "totalLines") || Map.get(file, :totalLines)
+
+    if path != "" do
+      summary = if num_lines, do: "#{path} (#{num_lines} lines)", else: path
+      [Event.tool_result("Read", summary, true)]
+    else
+      content = Map.get(result, "content") || Map.get(result, :content, "")
+      text = if is_binary(content), do: String.slice(content, 0, 500), else: inspect(content) |> String.slice(0, 200)
+      [Event.tool_result("tool", text, true)]
+    end
+  end
+
+  defp message_to_events(%UserMessage{}), do: []
+
+  # -- Result message --
   defp message_to_events(%ResultMessage{} = msg) do
     [%Event{
       type: :system,
@@ -183,8 +216,19 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
     }]
   end
 
-  # Catch-all for unhandled message types (system messages, rate limit events, etc.)
+  # Catch-all
   defp message_to_events(_msg), do: []
+
+  defp extract_result_text(content) when is_binary(content), do: content
+  defp extract_result_text(content) when is_list(content) do
+    Enum.map_join(content, " ", fn
+      %TextBlock{text: text} -> text
+      %{text: text} when is_binary(text) -> text
+      %{"text" => text} when is_binary(text) -> text
+      other -> inspect(other) |> String.slice(0, 100)
+    end)
+  end
+  defp extract_result_text(content), do: inspect(content) |> String.slice(0, 200)
 
   defp extract_session_id(%{session_id: id}) when is_binary(id), do: id
   defp extract_session_id(_msg), do: nil
