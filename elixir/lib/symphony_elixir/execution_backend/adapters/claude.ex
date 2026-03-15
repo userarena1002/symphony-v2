@@ -27,34 +27,48 @@ defmodule SymphonyElixir.ExecutionBackend.Adapters.Claude do
     allowed_tools = Keyword.get(opts, :allowed_tools, @default_allowed_tools)
     max_turns = Keyword.get(opts, :max_turns, 20)
     extra_args = Keyword.get(opts, :extra_args, [])
+    prompt_file = Keyword.get(opts, :prompt_file)
+
+    prompt_arg = if prompt_file do
+      ["-p", "\"$(cat #{shell_escape(prompt_file)})\""]
+    else
+      ["-p", shell_escape(prompt)]
+    end
 
     args =
+      ["claude"] ++
+      prompt_arg ++
       [
-        "claude",
-        "-p", shell_escape(prompt),
         "--output-format", "stream-json",
+        "--verbose",
         "--allowedTools", Enum.join(allowed_tools, ","),
         "--max-turns", to_string(max_turns),
-        "--cwd", shell_escape(workspace)
       ] ++ extra_args
 
-    Enum.join(args, " ") <> " 2>/dev/null"
+    Enum.join(args, " ")
   end
 
   @impl true
   def build_resume_command(workspace, session_id, prompt, opts \\ []) do
     extra_args = Keyword.get(opts, :extra_args, [])
+    prompt_file = Keyword.get(opts, :prompt_file)
+
+    prompt_arg = if prompt_file do
+      ["-p", "\"$(cat #{shell_escape(prompt_file)})\""]
+    else
+      ["-p", shell_escape(prompt)]
+    end
 
     args =
+      ["claude",
+       "--resume", shell_escape(session_id)] ++
+      prompt_arg ++
       [
-        "claude",
-        "--resume", shell_escape(session_id),
-        "-p", shell_escape(prompt),
         "--output-format", "stream-json",
-        "--cwd", shell_escape(workspace)
+        "--verbose",
       ] ++ extra_args
 
-    Enum.join(args, " ") <> " 2>/dev/null"
+    Enum.join(args, " ")
   end
 
   @impl true

@@ -55,6 +55,10 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
   @spec start(Path.t(), String.t(), keyword()) :: {:ok, handle()} | {:error, term()}
   def start(workspace, prompt, opts \\ []) do
     adapter = resolve_adapter(opts)
+
+    # Write prompt to a temp file to avoid shell escaping issues with long prompts
+    prompt_file = write_prompt_file(workspace, prompt)
+    opts = Keyword.put(opts, :prompt_file, prompt_file)
     command = adapter.build_command(workspace, prompt, opts)
 
     Logger.info("Starting #{adapter.agent_name()} session in #{workspace}")
@@ -259,6 +263,14 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
   end
 
   # -- Adapter resolution --
+
+  defp write_prompt_file(workspace, prompt) do
+    prompt_dir = Path.join(workspace, ".symphony")
+    File.mkdir_p!(prompt_dir)
+    prompt_file = Path.join(prompt_dir, "prompt.txt")
+    File.write!(prompt_file, prompt)
+    prompt_file
+  end
 
   defp resolve_adapter(opts) do
     backend = Keyword.get_lazy(opts, :backend, fn -> default_backend() end)

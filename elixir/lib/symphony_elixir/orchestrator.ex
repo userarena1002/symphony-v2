@@ -678,6 +678,17 @@ defmodule SymphonyElixir.Orchestrator do
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
 
+    # Move issue to "In Progress" on Linear when dispatching
+    if issue.state != "In Progress" do
+      case Tracker.update_issue_state(issue.id, "In Progress") do
+        :ok ->
+          Logger.info("Moved #{issue_context(issue)} to In Progress")
+
+        {:error, reason} ->
+          Logger.warning("Failed to move #{issue_context(issue)} to In Progress: #{inspect(reason)}")
+      end
+    end
+
     case select_worker_host(state, preferred_worker_host) do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
