@@ -52,41 +52,43 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
   defp run_claude_session(workspace, prompt, config, on_event, _opts) do
     Logger.info("Starting Claude Code session in #{workspace}")
 
-    # Emit init event
     on_event.(Event.system(:init, %{workspace: workspace, backend: "claude"}))
 
     sdk_opts = [
       max_turns: config.agent.max_turns,
       cwd: workspace,
-      allowed_tools: config.agent.allowed_tools,
-      permissions: %{allow: ["*"], deny: []},
-      system_prompt: "",
-      output_format: :stream_json
+      dangerously_skip_permissions: true
     ]
 
-    session_id = nil
+    # Start a session, stream messages in real-time, emit events as they arrive
+    {:ok, session} = ClaudeCode.start_link(sdk_opts)
 
-    case ClaudeCode.run(prompt, sdk_opts) do
-      {:ok, messages} when is_list(messages) ->
-        # Process all messages and emit events
-        session_id = extract_session_id_from_messages(messages)
+    try do
+      session_id = nil
 
-        for msg <- messages do
+      result =
+        session
+        |> ClaudeCode.stream(prompt)
+        |> Enum.reduce({nil, nil}, fn msg, {_last_result, sid} ->
+          # Extract session_id if available
+          new_sid = sid || extract_session_id_from_message(msg)
+
+          # Convert SDK message to Symphony events and emit
           events = message_to_events(msg)
           for event <- events do
-            event = %{event | session_id: session_id}
+            event = %{event | session_id: new_sid}
             on_event.(event)
           end
-        end
 
-        on_event.(Event.system(:done, %{status: :success, session_id: session_id}))
+          {msg, new_sid}
+        end)
 
-        {:ok, %{session_id: session_id, status: :completed}}
+      {last_msg, final_sid} = result
 
-      {:error, reason} ->
-        Logger.error("Claude Code session failed: #{inspect(reason)}")
-        on_event.(Event.error(reason))
-        {:error, reason}
+      on_event.(Event.system(:done, %{status: :success, session_id: final_sid}))
+      {:ok, %{session_id: final_sid, status: :completed}}
+    after
+      ClaudeCode.stop(session)
     end
   rescue
     e ->
@@ -95,87 +97,58 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
       {:error, {:crash, Exception.message(e)}}
   end
 
-  # -- Message to Event conversion --
+  # -- SDK Message to Symphony Event conversion --
 
-  defp message_to_events(%{role: :assistant, content: content}) when is_list(content) do
-    Enum.flat_map(content, fn
-      %{type: :text, text: text} ->
-        [%Event{type: :assistant, content: %{message: text}, raw: nil, timestamp: DateTime.utc_now()}]
+  alias ClaudeCode.Message.{AssistantMessage, UserMessage, ResultMessage}
 
-      %{type: :tool_use, name: name, input: input} ->
-        [%Event{type: :tool_use, content: %{tool: name, input: input || %{}}, raw: nil, timestamp: DateTime.utc_now()}]
-
-      %{type: :tool_result, content: result_content} ->
-        output = extract_tool_result_text(result_content)
-        [%Event{type: :tool_result, content: %{tool: "tool", output: output, success: true}, raw: nil, timestamp: DateTime.utc_now()}]
-
-      _ ->
-        []
-    end)
-  end
-
-  defp message_to_events(%{role: :user, content: content}) when is_list(content) do
-    Enum.flat_map(content, fn
-      %{type: :tool_result, content: result_content} ->
-        output = extract_tool_result_text(result_content)
-        [%Event{type: :tool_result, content: %{tool: "tool", output: String.slice(output, 0, 500), success: true}, raw: nil, timestamp: DateTime.utc_now()}]
-
-      _ ->
-        []
-    end)
-  end
-
-  # Handle raw map format (the SDK may return different shapes)
-  defp message_to_events(%{"type" => "assistant", "message" => %{"content" => content}}) when is_list(content) do
+  defp message_to_events(%AssistantMessage{message: %{"content" => content}} = msg) when is_list(content) do
     Enum.flat_map(content, fn
       %{"type" => "text", "text" => text} ->
-        [%Event{type: :assistant, content: %{message: text}, raw: nil, timestamp: DateTime.utc_now()}]
+        [Event.assistant(text)]
 
       %{"type" => "tool_use", "name" => name, "input" => input} ->
-        [%Event{type: :tool_use, content: %{tool: name, input: input || %{}}, raw: nil, timestamp: DateTime.utc_now()}]
+        [Event.tool_use(name, input || %{})]
 
       _ ->
         []
     end)
   end
 
-  defp message_to_events(%{"type" => "result"} = msg) do
+  defp message_to_events(%UserMessage{tool_use_result: %{"file" => file}} = _msg) when is_map(file) do
+    path = Map.get(file, "filePath", "")
+    [Event.tool_result("Read", "#{path}", true)]
+  end
+
+  defp message_to_events(%UserMessage{message: %{"content" => content}}) when is_list(content) do
+    Enum.flat_map(content, fn
+      %{"type" => "tool_result", "content" => result_text} when is_binary(result_text) ->
+        [Event.tool_result("tool", String.slice(result_text, 0, 500), true)]
+
+      _ ->
+        []
+    end)
+  end
+
+  defp message_to_events(%ResultMessage{} = msg) do
     [%Event{
       type: :system,
       content: %{
         subtype: :result,
-        result: Map.get(msg, "result"),
-        cost_usd: Map.get(msg, "total_cost_usd"),
-        duration_ms: Map.get(msg, "duration_ms"),
-        total_turns: Map.get(msg, "num_turns")
+        is_error: msg.is_error,
+        result: msg.result,
+        cost_usd: msg.total_cost_usd,
+        duration_ms: msg.duration_ms,
+        total_turns: msg.num_turns
       },
-      raw: msg,
+      raw: nil,
       timestamp: DateTime.utc_now()
     }]
   end
 
   defp message_to_events(_msg), do: []
 
-  defp extract_tool_result_text(content) when is_list(content) do
-    content
-    |> Enum.map(fn
-      %{type: :text, text: text} -> text
-      %{"type" => "text", "text" => text} -> text
-      other -> inspect(other)
-    end)
-    |> Enum.join("\n")
-  end
-
-  defp extract_tool_result_text(content) when is_binary(content), do: content
-  defp extract_tool_result_text(content), do: inspect(content)
-
-  defp extract_session_id_from_messages(messages) do
-    Enum.find_value(messages, fn
-      %{session_id: id} when is_binary(id) -> id
-      %{"session_id" => id} when is_binary(id) -> id
-      _ -> nil
-    end)
-  end
+  defp extract_session_id_from_message(%{session_id: id}) when is_binary(id), do: id
+  defp extract_session_id_from_message(_msg), do: nil
 
   # -- Helpers --
 
