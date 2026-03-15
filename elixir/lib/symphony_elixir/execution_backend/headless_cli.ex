@@ -237,6 +237,9 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
       {:ok, event} ->
         emit(on_event, event, handle)
 
+      {:ok_multi, events} when is_list(events) ->
+        Enum.each(events, fn event -> emit(on_event, event, handle) end)
+
       {:skip, _reason} ->
         :ok
 

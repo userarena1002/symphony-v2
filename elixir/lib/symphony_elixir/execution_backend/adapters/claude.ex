@@ -6,14 +6,15 @@ defmodule SymphonyElixir.ExecutionBackend.Adapters.Claude do
   headless mode (`--output-format stream-json`). Normalizes Claude's
   streaming JSON events into `SymphonyElixir.Event` structs.
 
-  ## Claude Code CLI flags used
+  ## Claude Code stream-json event format
 
-  - `-p <prompt>` — non-interactive (print) mode
-  - `--output-format stream-json` — streaming JSON events on stdout
-  - `--allowedTools <tools>` — restrict which tools the agent can use
-  - `--max-turns <n>` — limit the number of agentic turns
-  - `--resume <session_id>` — resume a previous session
-  - `--continue` — continue the most recent session
+  Events are line-delimited JSON. The key types are:
+
+  - `{"type":"system","subtype":"init","session_id":"..."}` — session start
+  - `{"type":"assistant","message":{"content":[...]}}` — assistant turn (text + tool_use blocks nested inside)
+  - `{"type":"user","tool_use_result":{...}}` — tool result
+  - `{"type":"result","subtype":"success"}` — session complete
+  - `{"type":"rate_limit_event",...}` — rate limit info
   """
 
   @behaviour SymphonyElixir.ExecutionBackend.AgentAdapter
@@ -71,74 +72,12 @@ defmodule SymphonyElixir.ExecutionBackend.Adapters.Claude do
     Enum.join(args, " ")
   end
 
+  # ── Event parsing ──
+  # Claude Code stream-json nests tool calls and text inside
+  # {"type":"assistant","message":{"content":[...]}}
+  # We flatten these into individual Event structs.
+
   @impl true
-  def parse_event(%{"type" => "assistant", "message" => message} = raw)
-      when is_binary(message) do
-    {:ok, %Event{
-      type: :assistant,
-      content: %{message: message},
-      raw: raw,
-      timestamp: parse_timestamp(raw)
-    }}
-  end
-
-  # Claude Code uses "content_block_delta" for streaming text chunks
-  def parse_event(%{"type" => "content_block_delta", "delta" => %{"text" => text}} = raw)
-      when is_binary(text) do
-    {:ok, %Event{
-      type: :assistant,
-      content: %{message: text, streaming: true},
-      raw: raw,
-      timestamp: parse_timestamp(raw)
-    }}
-  end
-
-  def parse_event(%{"type" => "tool_use", "name" => tool, "input" => input} = raw) do
-    {:ok, %Event{
-      type: :tool_use,
-      content: %{tool: tool, input: input || %{}},
-      raw: raw,
-      timestamp: parse_timestamp(raw)
-    }}
-  end
-
-  # Alternative tool_use shape
-  def parse_event(%{"type" => "tool_use", "tool" => tool, "input" => input} = raw) do
-    {:ok, %Event{
-      type: :tool_use,
-      content: %{tool: tool, input: input || %{}},
-      raw: raw,
-      timestamp: parse_timestamp(raw)
-    }}
-  end
-
-  def parse_event(%{"type" => "tool_result", "name" => tool} = raw) do
-    {:ok, %Event{
-      type: :tool_result,
-      content: %{
-        tool: tool,
-        output: Map.get(raw, "output", ""),
-        success: Map.get(raw, "is_error") != true
-      },
-      raw: raw,
-      timestamp: parse_timestamp(raw)
-    }}
-  end
-
-  # Alternative tool_result shape
-  def parse_event(%{"type" => "tool_result", "tool" => tool} = raw) do
-    {:ok, %Event{
-      type: :tool_result,
-      content: %{
-        tool: tool,
-        output: Map.get(raw, "output", ""),
-        success: Map.get(raw, "is_error") != true
-      },
-      raw: raw,
-      timestamp: parse_timestamp(raw)
-    }}
-  end
-
   def parse_event(%{"type" => "system", "subtype" => subtype} = raw) do
     {:ok, %Event{
       type: :system,
@@ -146,36 +85,106 @@ defmodule SymphonyElixir.ExecutionBackend.Adapters.Claude do
         subtype: safe_to_atom(subtype),
         session_id: Map.get(raw, "session_id"),
         result: Map.get(raw, "result"),
-        message: Map.get(raw, "message")
+        model: Map.get(raw, "model")
       },
       raw: raw,
-      timestamp: parse_timestamp(raw)
+      timestamp: DateTime.utc_now()
     }}
   end
 
-  # Message events (intermediate status)
-  def parse_event(%{"type" => "message"} = raw) do
-    role = Map.get(raw, "role", "assistant")
-    content = Map.get(raw, "content", [])
+  # Assistant message — contains text and/or tool_use blocks inside message.content[]
+  def parse_event(%{"type" => "assistant", "message" => %{"content" => content}} = raw)
+      when is_list(content) do
+    session_id = Map.get(raw, "session_id")
 
-    text =
+    # Extract text blocks
+    text_parts =
       content
       |> Enum.filter(&(is_map(&1) and Map.get(&1, "type") == "text"))
-      |> Enum.map_join("\n", & &1["text"])
+      |> Enum.map(& &1["text"])
 
-    if text == "" do
-      {:skip, :empty_message}
-    else
-      {:ok, %Event{
-        type: if(role == "user", do: :user, else: :assistant),
-        content: %{message: text},
-        raw: raw,
-        timestamp: parse_timestamp(raw)
-      }}
+    # Extract tool_use blocks
+    tool_uses =
+      content
+      |> Enum.filter(&(is_map(&1) and Map.get(&1, "type") == "tool_use"))
+
+    # Build events for each content block
+    events =
+      Enum.map(text_parts, fn text ->
+        %Event{
+          type: :assistant,
+          content: %{message: text},
+          raw: nil,
+          timestamp: DateTime.utc_now(),
+          session_id: session_id
+        }
+      end) ++
+      Enum.map(tool_uses, fn tool ->
+        %Event{
+          type: :tool_use,
+          content: %{
+            tool: Map.get(tool, "name", "unknown"),
+            input: Map.get(tool, "input", %{}),
+            tool_use_id: Map.get(tool, "id")
+          },
+          raw: nil,
+          timestamp: DateTime.utc_now(),
+          session_id: session_id
+        }
+      end)
+
+    case events do
+      [] -> {:skip, :empty_assistant}
+      [single] -> {:ok, single}
+      multiple -> {:ok_multi, multiple}
     end
   end
 
-  # Result event (final output)
+  # User message with tool result
+  def parse_event(%{"type" => "user", "tool_use_result" => result} = raw)
+      when is_map(result) do
+    file_info = Map.get(result, "file", %{})
+    output = Map.get(result, "content", "")
+
+    {:ok, %Event{
+      type: :tool_result,
+      content: %{
+        tool: "file_read",
+        output: truncate(output, 500),
+        success: true,
+        file_path: Map.get(file_info, "filePath")
+      },
+      raw: nil,
+      timestamp: DateTime.utc_now(),
+      session_id: Map.get(raw, "session_id")
+    }}
+  end
+
+  # User message with tool_result in content array
+  def parse_event(%{"type" => "user", "message" => %{"content" => content}} = raw)
+      when is_list(content) do
+    tool_results =
+      content
+      |> Enum.filter(&(is_map(&1) and Map.get(&1, "type") == "tool_result"))
+
+    case tool_results do
+      [] -> {:skip, :empty_user}
+      [result | _] ->
+        {:ok, %Event{
+          type: :tool_result,
+          content: %{
+            tool: "tool",
+            output: truncate(Map.get(result, "content", ""), 500),
+            success: true
+          },
+          raw: nil,
+          timestamp: DateTime.utc_now(),
+          session_id: Map.get(raw, "session_id")
+        }}
+    end
+  end
+
+  # Result event (session completion)
   def parse_event(%{"type" => "result"} = raw) do
     {:ok, %Event{
       type: :system,
@@ -183,22 +192,29 @@ defmodule SymphonyElixir.ExecutionBackend.Adapters.Claude do
         subtype: :result,
         session_id: Map.get(raw, "session_id"),
         result: Map.get(raw, "result"),
-        cost_usd: get_in(raw, ["cost_usd"]),
-        duration_ms: get_in(raw, ["duration_ms"]),
-        total_turns: get_in(raw, ["num_turns"])
+        is_error: Map.get(raw, "is_error", false),
+        cost_usd: Map.get(raw, "total_cost_usd"),
+        duration_ms: Map.get(raw, "duration_ms"),
+        total_turns: Map.get(raw, "num_turns"),
+        usage: Map.get(raw, "usage")
       },
       raw: raw,
-      timestamp: parse_timestamp(raw)
+      timestamp: DateTime.utc_now()
     }}
   end
 
-  # Catch-all for unrecognized events
+  # Rate limit event
+  def parse_event(%{"type" => "rate_limit_event"} = _raw) do
+    {:skip, :rate_limit}
+  end
+
+  # Catch-all
   def parse_event(%{"type" => type} = raw) when is_binary(type) do
     {:ok, %Event{
       type: :unknown,
       content: %{original_type: type},
       raw: raw,
-      timestamp: parse_timestamp(raw)
+      timestamp: DateTime.utc_now()
     }}
   end
 
@@ -216,8 +232,6 @@ defmodule SymphonyElixir.ExecutionBackend.Adapters.Claude do
   @impl true
   def completion_signal?(%{"type" => "result", "is_error" => true}), do: :failed
   def completion_signal?(%{"type" => "result"}), do: :completed
-  def completion_signal?(%{"type" => "system", "subtype" => "done", "result" => "error"}), do: :failed
-  def completion_signal?(%{"type" => "system", "subtype" => "done"}), do: :completed
   def completion_signal?(_), do: :running
 
   @impl true
@@ -229,18 +243,16 @@ defmodule SymphonyElixir.ExecutionBackend.Adapters.Claude do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
 
-  defp parse_timestamp(%{"timestamp" => ts}) when is_binary(ts) do
-    case DateTime.from_iso8601(ts) do
-      {:ok, dt, _} -> dt
-      _ -> DateTime.utc_now()
-    end
-  end
-
-  defp parse_timestamp(_), do: DateTime.utc_now()
-
   defp safe_to_atom(str) when is_binary(str) do
     String.to_existing_atom(str)
   rescue
     ArgumentError -> String.to_atom(str)
   end
+
+  defp truncate(text, max_len) when is_binary(text) and byte_size(text) > max_len do
+    String.slice(text, 0, max_len) <> "..."
+  end
+
+  defp truncate(text, _max_len) when is_binary(text), do: text
+  defp truncate(other, _max_len), do: inspect(other) |> String.slice(0, 200)
 end
