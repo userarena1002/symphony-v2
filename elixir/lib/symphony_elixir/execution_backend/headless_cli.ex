@@ -6,31 +6,28 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
   all the Port spawning, stdout buffering, JSON-RPC protocol, and session
   management correctly.
 
-  For other backends (Codex), falls back to direct Port spawning.
+  Key: uses `include_partial_messages: true` to get real-time streaming
+  events (tool progress, content deltas) for the live dashboard.
   """
 
   require Logger
 
   alias SymphonyElixir.{Config, Event}
-
-  @default_timeout_ms 3_600_000
-
-  @type handle :: %{
-          session_pid: pid() | nil,
-          adapter: module(),
-          session_id: String.t() | nil,
-          session_ref: reference(),
-          workspace: Path.t(),
-          started_at: DateTime.t()
-        }
+  alias ClaudeCode.Message.{
+    AssistantMessage,
+    PartialAssistantMessage,
+    ToolProgressMessage,
+    ToolUseSummaryMessage,
+    UserMessage,
+    ResultMessage
+  }
 
   @doc """
-  Start a new agent session and run it to completion.
+  Start a new agent session and run it to completion, emitting events in real-time.
 
-  Uses the claude_code SDK for Claude backend, which handles all Port
-  management and protocol details internally.
-
-  Returns {:ok, result} on success or {:error, reason} on failure.
+  Uses the claude_code SDK for Claude backend. Events are emitted via `on_event`
+  callback as they arrive from the streaming session, giving the dashboard
+  real-time visibility into what the agent is doing.
   """
   @spec run_session(Path.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_session(workspace, prompt, opts \\ []) do
@@ -60,30 +57,25 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
       dangerously_skip_permissions: true
     ]
 
-    # Start a session, stream messages in real-time, emit events as they arrive
     {:ok, session} = ClaudeCode.start_link(sdk_opts)
 
     try do
-      session_id = nil
+      # Pass include_partial_messages at query level for real-time streaming
+      query_opts = [include_partial_messages: true]
 
-      result =
+      {_last, final_sid} =
         session
-        |> ClaudeCode.stream(prompt)
-        |> Enum.reduce({nil, nil}, fn msg, {_last_result, sid} ->
-          # Extract session_id if available
-          new_sid = sid || extract_session_id_from_message(msg)
+        |> ClaudeCode.stream(prompt, query_opts)
+        |> Enum.reduce({nil, nil}, fn msg, {_last, sid} ->
+          new_sid = sid || extract_session_id(msg)
 
-          # Convert SDK message to Symphony events and emit
-          events = message_to_events(msg)
-          for event <- events do
-            event = %{event | session_id: new_sid}
-            on_event.(event)
+          # Convert SDK message to Symphony events and emit in real-time
+          for event <- message_to_events(msg) do
+            on_event.(%{event | session_id: new_sid})
           end
 
           {msg, new_sid}
         end)
-
-      {last_msg, final_sid} = result
 
       on_event.(Event.system(:done, %{status: :success, session_id: final_sid}))
       {:ok, %{session_id: final_sid, status: :completed}}
@@ -97,13 +89,56 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
       {:error, {:crash, Exception.message(e)}}
   end
 
-  # -- SDK Message to Symphony Event conversion --
+  # -- SDK Message → Symphony Event conversion --
+  #
+  # With include_partial_messages: true, the stream emits:
+  #   PartialAssistantMessage — streaming content deltas (text chunks, tool_use starts)
+  #   ToolProgressMessage — tool execution progress (tool name, elapsed time)
+  #   ToolUseSummaryMessage — summary of what a tool did
+  #   AssistantMessage — complete assistant turn
+  #   UserMessage — tool results
+  #   ResultMessage — session complete
 
-  alias ClaudeCode.Message.{AssistantMessage, UserMessage, ResultMessage}
+  # Partial messages: real-time streaming content
+  defp message_to_events(%PartialAssistantMessage{event: event} = msg) do
+    case event do
+      %{"type" => "content_block_start", "content_block" => %{"type" => "tool_use", "name" => name}} ->
+        [Event.tool_use(name, %{}, nil)]
 
-  defp message_to_events(%AssistantMessage{message: %{"content" => content}} = msg) when is_list(content) do
+      %{"type" => "content_block_start", "content_block" => %{"type" => "text", "text" => text}} when text != "" ->
+        [Event.assistant(text)]
+
+      %{"type" => "content_block_delta", "delta" => %{"type" => "text_delta", "text" => text}} when is_binary(text) and text != "" ->
+        [Event.assistant(text)]
+
+      %{"type" => "content_block_delta", "delta" => %{"type" => "input_json_delta", "partial_json" => _json}} ->
+        # Tool input streaming — skip to avoid noise, the full input comes with AssistantMessage
+        []
+
+      _ ->
+        []
+    end
+  end
+
+  # Tool progress: shows which tool is running and how long
+  defp message_to_events(%ToolProgressMessage{tool_name: name, tool_use_id: id} = _msg) do
+    [%Event{
+      type: :tool_use,
+      content: %{tool: name || "tool", input: %{}, tool_use_id: id, progress: true},
+      raw: nil,
+      timestamp: DateTime.utc_now()
+    }]
+  end
+
+  # Tool summary: what the tool accomplished
+  defp message_to_events(%ToolUseSummaryMessage{summary: summary} = _msg) when is_binary(summary) do
+    [Event.tool_result("tool", String.slice(summary, 0, 500), true)]
+  end
+
+  # Complete assistant message: full turn with all content blocks
+  defp message_to_events(%AssistantMessage{message: %{"content" => content}}) when is_list(content) do
     Enum.flat_map(content, fn
-      %{"type" => "text", "text" => text} ->
+      %{"type" => "text", "text" => text} when is_binary(text) and text != "" ->
         [Event.assistant(text)]
 
       %{"type" => "tool_use", "name" => name, "input" => input} ->
@@ -114,28 +149,31 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
     end)
   end
 
-  defp message_to_events(%UserMessage{tool_use_result: %{"file" => file}} = _msg) when is_map(file) do
+  # User message with file result
+  defp message_to_events(%UserMessage{tool_use_result: %{"file" => file}}) when is_map(file) do
     path = Map.get(file, "filePath", "")
-    [Event.tool_result("Read", "#{path}", true)]
+    [Event.tool_result("Read", path, true)]
   end
 
+  # User message with tool results
   defp message_to_events(%UserMessage{message: %{"content" => content}}) when is_list(content) do
     Enum.flat_map(content, fn
-      %{"type" => "tool_result", "content" => result_text} when is_binary(result_text) ->
-        [Event.tool_result("tool", String.slice(result_text, 0, 500), true)]
+      %{"type" => "tool_result", "content" => text} when is_binary(text) ->
+        [Event.tool_result("tool", String.slice(text, 0, 500), true)]
 
       _ ->
         []
     end)
   end
 
+  # Result message: session complete
   defp message_to_events(%ResultMessage{} = msg) do
     [%Event{
       type: :system,
       content: %{
         subtype: :result,
         is_error: msg.is_error,
-        result: msg.result,
+        result: if(is_binary(msg.result), do: String.slice(msg.result, 0, 500), else: nil),
         cost_usd: msg.total_cost_usd,
         duration_ms: msg.duration_ms,
         total_turns: msg.num_turns
@@ -145,10 +183,11 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
     }]
   end
 
+  # Catch-all for unhandled message types (system messages, rate limit events, etc.)
   defp message_to_events(_msg), do: []
 
-  defp extract_session_id_from_message(%{session_id: id}) when is_binary(id), do: id
-  defp extract_session_id_from_message(_msg), do: nil
+  defp extract_session_id(%{session_id: id}) when is_binary(id), do: id
+  defp extract_session_id(_msg), do: nil
 
   # -- Helpers --
 
