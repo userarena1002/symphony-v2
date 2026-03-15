@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  alias SymphonyElixir.{Config, Orchestrator}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -19,7 +19,7 @@ defmodule SymphonyElixirWeb.Presenter do
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
-          codex_totals: snapshot.codex_totals,
+          codex_totals: snapshot.codex_totals || %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
           rate_limits: snapshot.rate_limits
         }
 
@@ -75,10 +75,7 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       running: running && running_issue_payload(running),
       retry: retry && retry_issue_payload(retry),
-      logs: %{
-        codex_session_logs: []
-      },
-      recent_events: (running && recent_events_payload(running)) || [],
+      recent_events: [],
       last_error: retry && retry.error,
       tracked: %{}
     }
@@ -104,14 +101,14 @@ defmodule SymphonyElixirWeb.Presenter do
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
       turn_count: Map.get(entry, :turn_count, 0),
-      last_event: entry.last_codex_event,
-      last_message: summarize_message(entry.last_codex_message),
+      last_event: Map.get(entry, :last_event_type),
+      last_message: nil,
       started_at: iso8601(entry.started_at),
-      last_event_at: iso8601(entry.last_codex_timestamp),
+      last_event_at: iso8601(Map.get(entry, :last_event_timestamp)),
       tokens: %{
-        input_tokens: entry.codex_input_tokens,
-        output_tokens: entry.codex_output_tokens,
-        total_tokens: entry.codex_total_tokens
+        total_tokens: Map.get(entry, :total_tokens, 0),
+        input_tokens: 0,
+        output_tokens: 0
       }
     }
   end
@@ -136,13 +133,12 @@ defmodule SymphonyElixirWeb.Presenter do
       turn_count: Map.get(running, :turn_count, 0),
       state: running.state,
       started_at: iso8601(running.started_at),
-      last_event: running.last_codex_event,
-      last_message: summarize_message(running.last_codex_message),
-      last_event_at: iso8601(running.last_codex_timestamp),
+      last_event: Map.get(running, :last_event_type),
+      last_event_at: iso8601(Map.get(running, :last_event_timestamp)),
       tokens: %{
-        input_tokens: running.codex_input_tokens,
-        output_tokens: running.codex_output_tokens,
-        total_tokens: running.codex_total_tokens
+        total_tokens: Map.get(running, :total_tokens, 0),
+        input_tokens: 0,
+        output_tokens: 0
       }
     }
   end
@@ -166,20 +162,6 @@ defmodule SymphonyElixirWeb.Presenter do
   defp workspace_host(running, retry) do
     (running && Map.get(running, :worker_host)) || (retry && Map.get(retry, :worker_host))
   end
-
-  defp recent_events_payload(running) do
-    [
-      %{
-        at: iso8601(running.last_codex_timestamp),
-        event: running.last_codex_event,
-        message: summarize_message(running.last_codex_message)
-      }
-    ]
-    |> Enum.reject(&is_nil(&1.at))
-  end
-
-  defp summarize_message(nil), do: nil
-  defp summarize_message(message), do: StatusDashboard.humanize_codex_message(message)
 
   defp due_at_iso8601(due_in_ms) when is_integer(due_in_ms) do
     DateTime.utc_now()

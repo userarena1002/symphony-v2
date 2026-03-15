@@ -1,12 +1,22 @@
 defmodule SymphonyElixirWeb.DashboardLive do
   @moduledoc """
-  Live observability dashboard for Symphony.
+  Live observability dashboard for Symphony V2.
+
+  Features:
+  - Real-time agent list with status indicators
+  - Expandable per-agent live event streams (tool calls, reasoning, diffs)
+  - Chat input for human-in-the-loop message injection
+  - Preview links for testing completed features
+  - Retry queue visibility
   """
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
+  alias SymphonyElixir.{EventBus, PreviewManager}
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
+
   @runtime_tick_ms 1_000
+  @max_events_per_agent 200
 
   @impl true
   def mount(_params, _session, socket) do
@@ -14,9 +24,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
       socket
       |> assign(:payload, load_payload())
       |> assign(:now, DateTime.utc_now())
+      |> assign(:expanded, MapSet.new())
+      |> assign(:agent_events, %{})
+      |> assign(:subscribed_issues, MapSet.new())
 
     if connected?(socket) do
       :ok = ObservabilityPubSub.subscribe()
+      :ok = EventBus.subscribe_state()
       schedule_runtime_tick()
     end
 
@@ -26,7 +40,15 @@ defmodule SymphonyElixirWeb.DashboardLive do
   @impl true
   def handle_info(:runtime_tick, socket) do
     schedule_runtime_tick()
-    {:noreply, assign(socket, :now, DateTime.utc_now())}
+    payload = load_payload()
+
+    # Auto-subscribe to events for any running issues we haven't subscribed to yet
+    socket = maybe_subscribe_running_issues(socket, payload)
+
+    {:noreply,
+     socket
+     |> assign(:payload, payload)
+     |> assign(:now, DateTime.utc_now())}
   end
 
   @impl true
@@ -38,31 +60,81 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   @impl true
+  def handle_info({:orchestrator_state, _state}, socket) do
+    {:noreply, assign(socket, :payload, load_payload())}
+  end
+
+  @impl true
+  def handle_info({:agent_event, event}, socket) do
+    issue_id = event.issue_id
+
+    if issue_id && MapSet.member?(socket.assigns.expanded, issue_id) do
+      events = Map.get(socket.assigns.agent_events, issue_id, [])
+      updated = Enum.take([event | events], @max_events_per_agent)
+      agent_events = Map.put(socket.assigns.agent_events, issue_id, updated)
+      {:noreply, assign(socket, :agent_events, agent_events)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  @impl true
+  def handle_info(_msg, socket), do: {:noreply, socket}
+
+  # -- Events from the UI --
+
+  @impl true
+  def handle_event("toggle_expand", %{"issue-id" => issue_id}, socket) do
+    expanded = socket.assigns.expanded
+
+    socket =
+      if MapSet.member?(expanded, issue_id) do
+        EventBus.unsubscribe_events(issue_id)
+
+        socket
+        |> assign(:expanded, MapSet.delete(expanded, issue_id))
+        |> assign(:subscribed_issues, MapSet.delete(socket.assigns.subscribed_issues, issue_id))
+      else
+        EventBus.subscribe_events(issue_id)
+
+        socket
+        |> assign(:expanded, MapSet.put(expanded, issue_id))
+        |> assign(:subscribed_issues, MapSet.put(socket.assigns.subscribed_issues, issue_id))
+      end
+
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_event("send_message", %{"message" => message, "issue-id" => issue_id}, socket)
+      when is_binary(message) and message != "" do
+    # Broadcast a user event through the EventBus
+    user_event = SymphonyElixir.Event.user(message, :dashboard)
+    EventBus.broadcast_event(issue_id, user_event)
+
+    {:noreply, socket}
+  end
+
+  def handle_event("send_message", _params, socket), do: {:noreply, socket}
+
+  # -- Render --
+
+  @impl true
   def render(assigns) do
     ~H"""
     <section class="dashboard-shell">
       <header class="hero-card">
         <div class="hero-grid">
           <div>
-            <p class="eyebrow">
-              Symphony Observability
-            </p>
-            <h1 class="hero-title">
-              Operations Dashboard
-            </h1>
+            <p class="eyebrow">Symphony V2</p>
+            <h1 class="hero-title">Operations Dashboard</h1>
             <p class="hero-copy">
-              Current state, retry pressure, token usage, and orchestration health for the active Symphony runtime.
+              Live agent streams, preview links, and orchestration health.
             </p>
           </div>
-
           <div class="status-stack">
             <span class="status-badge status-badge-live">
-              <span class="status-badge-dot"></span>
-              Live
-            </span>
-            <span class="status-badge status-badge-offline">
-              <span class="status-badge-dot"></span>
-              Offline
+              <span class="status-badge-dot"></span> Live
             </span>
           </div>
         </div>
@@ -70,171 +142,129 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
       <%= if @payload[:error] do %>
         <section class="error-card">
-          <h2 class="error-title">
-            Snapshot unavailable
-          </h2>
+          <h2 class="error-title">Snapshot unavailable</h2>
           <p class="error-copy">
             <strong><%= @payload.error.code %>:</strong> <%= @payload.error.message %>
           </p>
         </section>
       <% else %>
+        <%!-- Metric cards --%>
         <section class="metric-grid">
           <article class="metric-card">
             <p class="metric-label">Running</p>
             <p class="metric-value numeric"><%= @payload.counts.running %></p>
-            <p class="metric-detail">Active issue sessions in the current runtime.</p>
           </article>
-
           <article class="metric-card">
             <p class="metric-label">Retrying</p>
             <p class="metric-value numeric"><%= @payload.counts.retrying %></p>
-            <p class="metric-detail">Issues waiting for the next retry window.</p>
           </article>
-
           <article class="metric-card">
-            <p class="metric-label">Total tokens</p>
+            <p class="metric-label">Total Tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
-            <p class="metric-detail numeric">
-              In <%= format_int(@payload.codex_totals.input_tokens) %> / Out <%= format_int(@payload.codex_totals.output_tokens) %>
-            </p>
           </article>
-
           <article class="metric-card">
             <p class="metric-label">Runtime</p>
             <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
-            <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
           </article>
         </section>
 
+        <%!-- Running agents --%>
         <section class="section-card">
           <div class="section-header">
-            <div>
-              <h2 class="section-title">Rate limits</h2>
-              <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
-            </div>
-          </div>
-
-          <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
-        </section>
-
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Running sessions</h2>
-              <p class="section-copy">Active issues, last known agent activity, and token usage.</p>
-            </div>
+            <h2 class="section-title">Active Agents</h2>
           </div>
 
           <%= if @payload.running == [] do %>
-            <p class="empty-state">No active sessions.</p>
+            <p class="empty-state">No active sessions. Issues in active states will be picked up on the next poll.</p>
           <% else %>
-            <div class="table-wrap">
-              <table class="data-table data-table-running">
-                <colgroup>
-                  <col style="width: 12rem;" />
-                  <col style="width: 8rem;" />
-                  <col style="width: 7.5rem;" />
-                  <col style="width: 8.5rem;" />
-                  <col />
-                  <col style="width: 10rem;" />
-                </colgroup>
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>State</th>
-                    <th>Session</th>
-                    <th>Runtime / turns</th>
-                    <th>Codex update</th>
-                    <th>Tokens</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.running}>
-                    <td>
-                      <div class="issue-stack">
-                        <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                      </div>
-                    </td>
-                    <td>
-                      <span class={state_badge_class(entry.state)}>
-                        <%= entry.state %>
+            <div class="agent-list">
+              <%= for entry <- @payload.running do %>
+                <% is_expanded = MapSet.member?(@expanded, entry.issue_id) %>
+                <div class={"agent-card #{if is_expanded, do: "agent-card-expanded", else: ""}"}>
+                  <%!-- Agent row (always visible) --%>
+                  <div class="agent-row" phx-click="toggle_expand" phx-value-issue-id={entry.issue_id}>
+                    <div class="agent-row-main">
+                      <span class="agent-identifier"><%= entry.issue_identifier %></span>
+                      <span class={state_badge_class(entry.state)}><%= entry.state %></span>
+                      <span class="agent-session mono"><%= compact_session(entry.session_id) %></span>
+                    </div>
+                    <div class="agent-row-meta">
+                      <span class="agent-runtime numeric">
+                        <%= format_runtime(entry.started_at, @now) %>
+                        <%= if entry.turn_count > 0 do %>
+                          / <%= entry.turn_count %> turns
+                        <% end %>
                       </span>
-                    </td>
-                    <td>
-                      <div class="session-stack">
-                        <%= if entry.session_id do %>
-                          <button
-                            type="button"
-                            class="subtle-button"
-                            data-label="Copy ID"
-                            data-copy={entry.session_id}
-                            onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
-                          >
-                            Copy ID
-                          </button>
-                        <% else %>
-                          <span class="muted">n/a</span>
+                      <span class="agent-tokens numeric"><%= format_int(entry.tokens.total_tokens) %> tokens</span>
+                      <span class="agent-expand-icon"><%= if is_expanded, do: "▾", else: "▸" %></span>
+                    </div>
+                  </div>
+
+                  <%!-- Expanded: live event stream + chat --%>
+                  <%= if is_expanded do %>
+                    <div class="agent-detail">
+                      <%!-- Preview link --%>
+                      <div class="agent-preview-bar">
+                        <span class="muted">Workspace: <code><%= entry.workspace_path || "pending" %></code></span>
+                        <%!-- Preview URL will be populated when available --%>
+                      </div>
+
+                      <%!-- Event stream --%>
+                      <div class="event-stream" id={"stream-#{entry.issue_id}"} phx-update="stream">
+                        <%= for event <- Enum.reverse(Map.get(@agent_events, entry.issue_id, [])) do %>
+                          <div class={"event-line event-#{event.type}"} id={"evt-#{:erlang.phash2(event)}"}>
+                            <span class="event-time mono"><%= format_event_time(event.timestamp) %></span>
+                            <span class="event-badge"><%= event_badge(event) %></span>
+                            <span class="event-content"><%= event_content(event) %></span>
+                          </div>
+                        <% end %>
+
+                        <%= if Map.get(@agent_events, entry.issue_id, []) == [] do %>
+                          <div class="event-line event-system">
+                            <span class="muted">Waiting for events...</span>
+                          </div>
                         <% end %>
                       </div>
-                    </td>
-                    <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
-                    <td>
-                      <div class="detail-stack">
-                        <span
-                          class="event-text"
-                          title={entry.last_message || to_string(entry.last_event || "n/a")}
-                        ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
-                        <span class="muted event-meta">
-                          <%= entry.last_event || "n/a" %>
-                          <%= if entry.last_event_at do %>
-                            · <span class="mono numeric"><%= entry.last_event_at %></span>
-                          <% end %>
-                        </span>
-                      </div>
-                    </td>
-                    <td>
-                      <div class="token-stack numeric">
-                        <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
-                        <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
-                      </div>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
+
+                      <%!-- Chat input --%>
+                      <form class="chat-form" phx-submit="send_message">
+                        <input type="hidden" name="issue-id" value={entry.issue_id} />
+                        <input
+                          type="text"
+                          name="message"
+                          placeholder="Send a message to this agent..."
+                          class="chat-input"
+                          autocomplete="off"
+                        />
+                        <button type="submit" class="chat-send">Send</button>
+                      </form>
+                    </div>
+                  <% end %>
+                </div>
+              <% end %>
             </div>
           <% end %>
         </section>
 
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Retry queue</h2>
-              <p class="section-copy">Issues waiting for the next retry window.</p>
+        <%!-- Retry queue --%>
+        <%= if @payload.retrying != [] do %>
+          <section class="section-card">
+            <div class="section-header">
+              <h2 class="section-title">Retry Queue</h2>
             </div>
-          </div>
-
-          <%= if @payload.retrying == [] do %>
-            <p class="empty-state">No issues are currently backing off.</p>
-          <% else %>
             <div class="table-wrap">
-              <table class="data-table" style="min-width: 680px;">
+              <table class="data-table">
                 <thead>
                   <tr>
                     <th>Issue</th>
                     <th>Attempt</th>
-                    <th>Due at</th>
+                    <th>Due</th>
                     <th>Error</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr :for={entry <- @payload.retrying}>
-                    <td>
-                      <div class="issue-stack">
-                        <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                      </div>
-                    </td>
+                    <td><span class="issue-id"><%= entry.issue_identifier %></span></td>
                     <td><%= entry.attempt %></td>
                     <td class="mono"><%= entry.due_at || "n/a" %></td>
                     <td><%= entry.error || "n/a" %></td>
@@ -242,12 +272,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 </tbody>
               </table>
             </div>
-          <% end %>
-        </section>
+          </section>
+        <% end %>
       <% end %>
     </section>
     """
   end
+
+  # -- Private helpers --
 
   defp load_payload do
     Presenter.state_payload(orchestrator(), snapshot_timeout_ms())
@@ -261,43 +293,57 @@ defmodule SymphonyElixirWeb.DashboardLive do
     Endpoint.config(:snapshot_timeout_ms) || 15_000
   end
 
-  defp completed_runtime_seconds(payload) do
-    payload.codex_totals.seconds_running || 0
+  defp maybe_subscribe_running_issues(socket, payload) do
+    case payload do
+      %{running: running} when is_list(running) ->
+        running_ids = running |> Enum.map(& &1.issue_id) |> MapSet.new()
+        already_subscribed = socket.assigns.subscribed_issues
+
+        # Subscribe to new running issues
+        new_ids = MapSet.difference(running_ids, already_subscribed)
+        Enum.each(new_ids, &EventBus.subscribe_events/1)
+
+        assign(socket, :subscribed_issues, MapSet.union(already_subscribed, new_ids))
+
+      _ ->
+        socket
+    end
   end
 
   defp total_runtime_seconds(payload, now) do
-    completed_runtime_seconds(payload) +
+    completed = Map.get(payload.codex_totals, :seconds_running, 0)
+
+    active =
       Enum.reduce(payload.running, 0, fn entry, total ->
-        total + runtime_seconds_from_started_at(entry.started_at, now)
+        total + runtime_seconds_since(entry.started_at, now)
       end)
+
+    completed + active
   end
 
-  defp format_runtime_and_turns(started_at, turn_count, now) when is_integer(turn_count) and turn_count > 0 do
-    "#{format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))} / #{turn_count}"
+  defp runtime_seconds_since(%DateTime{} = started, %DateTime{} = now) do
+    max(DateTime.diff(now, started, :second), 0)
   end
 
-  defp format_runtime_and_turns(started_at, _turn_count, now),
-    do: format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))
-
-  defp format_runtime_seconds(seconds) when is_number(seconds) do
-    whole_seconds = max(trunc(seconds), 0)
-    mins = div(whole_seconds, 60)
-    secs = rem(whole_seconds, 60)
-    "#{mins}m #{secs}s"
-  end
-
-  defp runtime_seconds_from_started_at(%DateTime{} = started_at, %DateTime{} = now) do
-    DateTime.diff(now, started_at, :second)
-  end
-
-  defp runtime_seconds_from_started_at(started_at, %DateTime{} = now) when is_binary(started_at) do
-    case DateTime.from_iso8601(started_at) do
-      {:ok, parsed, _offset} -> runtime_seconds_from_started_at(parsed, now)
+  defp runtime_seconds_since(started, %DateTime{} = now) when is_binary(started) do
+    case DateTime.from_iso8601(started) do
+      {:ok, parsed, _} -> runtime_seconds_since(parsed, now)
       _ -> 0
     end
   end
 
-  defp runtime_seconds_from_started_at(_started_at, _now), do: 0
+  defp runtime_seconds_since(_, _), do: 0
+
+  defp format_runtime(started_at, now) do
+    format_runtime_seconds(runtime_seconds_since(started_at, now))
+  end
+
+  defp format_runtime_seconds(seconds) when is_number(seconds) do
+    whole = max(trunc(seconds), 0)
+    mins = div(whole, 60)
+    secs = rem(whole, 60)
+    "#{mins}m #{secs}s"
+  end
 
   defp format_int(value) when is_integer(value) do
     value
@@ -307,7 +353,76 @@ defmodule SymphonyElixirWeb.DashboardLive do
     |> String.reverse()
   end
 
-  defp format_int(_value), do: "n/a"
+  defp format_int(_), do: "0"
+
+  defp compact_session(nil), do: "pending"
+  defp compact_session(id) when is_binary(id), do: String.slice(id, 0, 12) <> "..."
+
+  defp format_event_time(%DateTime{} = dt) do
+    Calendar.strftime(dt, "%H:%M:%S")
+  end
+
+  defp format_event_time(_), do: ""
+
+  defp event_badge(%{type: :assistant}), do: "AI"
+  defp event_badge(%{type: :tool_use}), do: "TOOL"
+  defp event_badge(%{type: :tool_result, content: %{success: true}}), do: "OK"
+  defp event_badge(%{type: :tool_result, content: %{success: false}}), do: "ERR"
+  defp event_badge(%{type: :tool_result}), do: "RESULT"
+  defp event_badge(%{type: :system}), do: "SYS"
+  defp event_badge(%{type: :user}), do: "YOU"
+  defp event_badge(%{type: :error}), do: "ERR"
+  defp event_badge(_), do: "?"
+
+  defp event_content(%{type: :assistant, content: %{message: msg}}) when is_binary(msg) do
+    String.slice(msg, 0, 500)
+  end
+
+  defp event_content(%{type: :tool_use, content: %{tool: tool, input: input}}) do
+    case tool do
+      t when t in ["Read", "read", "read_file"] ->
+        "Reading #{input["file_path"] || input[:file_path] || "file"}"
+
+      t when t in ["Write", "write", "write_file"] ->
+        "Writing #{input["file_path"] || input[:file_path] || "file"}"
+
+      t when t in ["Edit", "edit", "edit_file"] ->
+        "Editing #{input["file_path"] || input[:file_path] || "file"}"
+
+      t when t in ["Bash", "bash", "shell"] ->
+        cmd = input["command"] || input[:command] || ""
+        "Running: #{String.slice(cmd, 0, 100)}"
+
+      t when t in ["Glob", "glob"] ->
+        "Searching: #{input["pattern"] || input[:pattern] || ""}"
+
+      t when t in ["Grep", "grep"] ->
+        "Grep: #{input["pattern"] || input[:pattern] || ""}"
+
+      _ ->
+        "#{tool}(#{inspect(input) |> String.slice(0, 100)})"
+    end
+  end
+
+  defp event_content(%{type: :tool_result, content: %{tool: tool, output: output, success: success}}) do
+    status = if success, do: "ok", else: "failed"
+    output_preview = if is_binary(output), do: String.slice(output, 0, 200), else: ""
+    "#{tool} #{status}: #{output_preview}"
+  end
+
+  defp event_content(%{type: :system, content: %{subtype: subtype}}) do
+    "System: #{subtype}"
+  end
+
+  defp event_content(%{type: :user, content: %{message: msg}}) when is_binary(msg) do
+    msg
+  end
+
+  defp event_content(%{type: :error, content: %{reason: reason}}) do
+    "Error: #{inspect(reason)}"
+  end
+
+  defp event_content(_event), do: ""
 
   defp state_badge_class(state) do
     base = "state-badge"
@@ -315,8 +430,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
     cond do
       String.contains?(normalized, ["progress", "running", "active"]) -> "#{base} state-badge-active"
+      String.contains?(normalized, ["edit"]) -> "#{base} state-badge-edit"
+      String.contains?(normalized, ["review"]) -> "#{base} state-badge-review"
       String.contains?(normalized, ["blocked", "error", "failed"]) -> "#{base} state-badge-danger"
-      String.contains?(normalized, ["todo", "queued", "pending", "retry"]) -> "#{base} state-badge-warning"
+      String.contains?(normalized, ["todo", "queued", "pending"]) -> "#{base} state-badge-warning"
       true -> base
     end
   end
@@ -324,7 +441,4 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp schedule_runtime_tick do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)
   end
-
-  defp pretty_value(nil), do: "n/a"
-  defp pretty_value(value), do: inspect(value, pretty: true, limit: :infinity)
 end

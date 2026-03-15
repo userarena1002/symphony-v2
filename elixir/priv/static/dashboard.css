@@ -461,3 +461,262 @@ pre,
     padding: 1rem;
   }
 }
+
+/* ── Agent list & expandable cards ── */
+
+.agent-list {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.agent-card {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--page-soft);
+  overflow: hidden;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.agent-card:hover {
+  border-color: var(--line-strong);
+}
+
+.agent-card-expanded {
+  border-color: var(--accent);
+  box-shadow: 0 4px 16px rgba(16, 163, 127, 0.08);
+}
+
+.agent-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  cursor: pointer;
+  user-select: none;
+  gap: 1rem;
+}
+
+.agent-row:hover {
+  background: rgba(16, 163, 127, 0.03);
+}
+
+.agent-row-main {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.agent-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-shrink: 0;
+}
+
+.agent-identifier {
+  font-weight: 700;
+  font-size: 0.95rem;
+  letter-spacing: -0.01em;
+}
+
+.agent-session {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.agent-runtime,
+.agent-tokens {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.agent-expand-icon {
+  font-size: 1.1rem;
+  color: var(--muted);
+  width: 1.2rem;
+  text-align: center;
+}
+
+/* ── Agent detail (expanded) ── */
+
+.agent-detail {
+  border-top: 1px solid var(--line);
+  padding: 0.75rem 1rem 1rem;
+  background: white;
+}
+
+.agent-preview-bar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+}
+
+.agent-preview-bar code {
+  font-size: 0.82rem;
+  background: var(--card-muted);
+  padding: 0.15rem 0.4rem;
+  border-radius: 6px;
+}
+
+.preview-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.3rem 0.6rem;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font-size: 0.82rem;
+  font-weight: 600;
+  border: 1px solid rgba(16, 163, 127, 0.18);
+  text-decoration: none;
+}
+
+.preview-link:hover {
+  background: rgba(16, 163, 127, 0.15);
+}
+
+/* ── Event stream ── */
+
+.event-stream {
+  max-height: 400px;
+  overflow-y: auto;
+  background: #1a1b26;
+  border-radius: 12px;
+  padding: 0.75rem;
+  font-family: "Sohne Mono", "SFMono-Regular", "SF Mono", Consolas, monospace;
+  font-size: 0.82rem;
+  line-height: 1.6;
+  color: #a9b1d6;
+}
+
+.event-line {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.15rem 0;
+  align-items: baseline;
+}
+
+.event-time {
+  color: #565f89;
+  flex-shrink: 0;
+  font-size: 0.78rem;
+}
+
+.event-badge {
+  flex-shrink: 0;
+  min-width: 3.5rem;
+  text-align: center;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.event-assistant .event-badge {
+  background: rgba(122, 162, 247, 0.15);
+  color: #7aa2f7;
+}
+
+.event-tool_use .event-badge {
+  background: rgba(224, 175, 104, 0.15);
+  color: #e0af68;
+}
+
+.event-tool_result .event-badge {
+  background: rgba(158, 206, 106, 0.15);
+  color: #9ece6a;
+}
+
+.event-system .event-badge {
+  background: rgba(169, 177, 214, 0.1);
+  color: #565f89;
+}
+
+.event-user .event-badge {
+  background: rgba(187, 154, 247, 0.15);
+  color: #bb9af7;
+}
+
+.event-error .event-badge {
+  background: rgba(247, 118, 142, 0.15);
+  color: #f7768e;
+}
+
+.event-content {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #c0caf5;
+}
+
+.event-assistant .event-content {
+  color: #c0caf5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.event-user .event-content {
+  color: #bb9af7;
+  font-style: italic;
+}
+
+.event-error .event-content {
+  color: #f7768e;
+}
+
+/* ── Chat input ── */
+
+.chat-form {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.chat-input {
+  flex: 1;
+  padding: 0.6rem 0.85rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  font: inherit;
+  font-size: 0.9rem;
+  background: white;
+  color: var(--ink);
+  outline: none;
+  transition: border-color 140ms ease;
+}
+
+.chat-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(16, 163, 127, 0.1);
+}
+
+.chat-input::placeholder {
+  color: var(--muted);
+}
+
+.chat-send {
+  padding: 0.6rem 1.2rem;
+  border-radius: 12px;
+  font-size: 0.88rem;
+}
+
+/* ── State badge variants (new) ── */
+
+.state-badge-edit {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: #1e40af;
+}
+
+.state-badge-review {
+  background: #fefce8;
+  border-color: #fde68a;
+  color: #92400e;
+}
