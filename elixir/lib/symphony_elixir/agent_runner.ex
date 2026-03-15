@@ -78,29 +78,16 @@ defmodule SymphonyElixir.AgentRunner do
 
     cli_opts = [
       backend: config.agent.backend,
-      allowed_tools: config.agent.allowed_tools,
-      max_turns: config.agent.max_turns,
-      timeout_ms: config.agent.session_timeout_ms
+      on_event: on_event
     ]
 
-    case HeadlessCLI.start(workspace, prompt, cli_opts) do
-      {:ok, handle} ->
-        try do
-          case HeadlessCLI.run(handle, on_event: on_event, timeout_ms: config.agent.session_timeout_ms) do
-            {:ok, result} ->
-              Logger.info("Agent session completed for #{issue_context(issue)} session_id=#{result[:session_id]}")
-              :ok
-
-            {:error, reason} ->
-              Logger.warning("Agent session ended with error for #{issue_context(issue)}: #{inspect(reason)}")
-              {:error, reason}
-          end
-        after
-          HeadlessCLI.stop(handle)
-        end
+    case HeadlessCLI.run_session(workspace, prompt, cli_opts) do
+      {:ok, result} ->
+        Logger.info("Agent session completed for #{issue_context(issue)} session_id=#{result[:session_id]}")
+        :ok
 
       {:error, reason} ->
-        Logger.error("Failed to start agent session for #{issue_context(issue)}: #{inspect(reason)}")
+        Logger.warning("Agent session ended with error for #{issue_context(issue)}: #{inspect(reason)}")
         {:error, reason}
     end
   end
@@ -111,6 +98,8 @@ defmodule SymphonyElixir.AgentRunner do
     fn event ->
       # Attach issue context to the event
       event = %{event | issue_id: issue_id}
+
+      Logger.info("Agent event for #{issue_id}: type=#{event.type} content=#{inspect(Map.keys(event.content))}")
 
       # Broadcast through EventBus for dashboard/memory/logs
       EventBus.broadcast_event(issue_id, event)

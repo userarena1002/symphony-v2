@@ -2,37 +2,21 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
   @moduledoc """
   Backend-agnostic process manager for headless CLI coding agents.
 
-  Spawns an agent CLI as an Erlang Port, reads streaming JSON events from
-  stdout, parses them through the configured adapter, and emits normalized
-  `SymphonyElixir.Event` structs via a callback function.
+  Uses the `claude_code` Elixir SDK for Claude Code execution, which handles
+  all the Port spawning, stdout buffering, JSON-RPC protocol, and session
+  management correctly.
 
-  This module replaces the Codex AppServer JSON-RPC client. Instead of
-  marshalling every tool call through the orchestrator, agents run
-  autonomously and emit events that we observe.
-
-  ## Usage
-
-      {:ok, handle} = HeadlessCLI.start(workspace, prompt,
-        backend: "claude",
-        on_event: fn event -> IO.inspect(event) end
-      )
-
-      # Process runs autonomously until completion or timeout
-      # Events are emitted via the on_event callback
-
-      HeadlessCLI.stop(handle)
+  For other backends (Codex), falls back to direct Port spawning.
   """
 
   require Logger
 
   alias SymphonyElixir.{Config, Event}
-  alias SymphonyElixir.ExecutionBackend.Adapters
 
-  @port_line_bytes 1_048_576
   @default_timeout_ms 3_600_000
 
   @type handle :: %{
-          port: port(),
+          session_pid: pid() | nil,
           adapter: module(),
           session_id: String.t() | nil,
           session_ref: reference(),
@@ -41,250 +25,159 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
         }
 
   @doc """
-  Start a new agent session in the given workspace.
+  Start a new agent session and run it to completion.
 
-  ## Options
+  Uses the claude_code SDK for Claude backend, which handles all Port
+  management and protocol details internally.
 
-  - `:backend` — `"claude"` or `"codex"` (defaults to config `agent.backend`)
-  - `:on_event` — callback `(Event.t() -> :ok)` called for each normalized event
-  - `:allowed_tools` — list of tool names the agent can use
-  - `:max_turns` — max agentic turns
-  - `:extra_args` — additional CLI arguments
-  - `:timeout_ms` — max session duration in milliseconds
+  Returns {:ok, result} on success or {:error, reason} on failure.
   """
-  @spec start(Path.t(), String.t(), keyword()) :: {:ok, handle()} | {:error, term()}
-  def start(workspace, prompt, opts \\ []) do
-    adapter = resolve_adapter(opts)
-
-    # Write prompt to a temp file to avoid shell escaping issues with long prompts
-    prompt_file = write_prompt_file(workspace, prompt)
-    opts = Keyword.put(opts, :prompt_file, prompt_file)
-    command = adapter.build_command(workspace, prompt, opts)
-
-    Logger.info("Starting #{adapter.agent_name()} session in #{workspace}")
-    Logger.debug("Command: #{command}")
-
-    case spawn_port(workspace, command) do
-      {:ok, port} ->
-        handle = %{
-          port: port,
-          adapter: adapter,
-          session_id: nil,
-          session_ref: make_ref(),
-          workspace: workspace,
-          started_at: DateTime.utc_now()
-        }
-
-        {:ok, handle}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  @doc """
-  Resume an existing agent session.
-
-  Used for the Edit column workflow — continues a prior session with a new
-  prompt (typically containing reviewer feedback).
-  """
-  @spec resume(Path.t(), String.t(), String.t(), keyword()) :: {:ok, handle()} | {:error, term()}
-  def resume(workspace, session_id, prompt, opts \\ []) do
-    adapter = resolve_adapter(opts)
-    command = adapter.build_resume_command(workspace, session_id, prompt, opts)
-
-    Logger.info("Resuming #{adapter.agent_name()} session #{session_id} in #{workspace}")
-    Logger.debug("Command: #{command}")
-
-    case spawn_port(workspace, command) do
-      {:ok, port} ->
-        handle = %{
-          port: port,
-          adapter: adapter,
-          session_id: session_id,
-          session_ref: make_ref(),
-          workspace: workspace,
-          started_at: DateTime.utc_now()
-        }
-
-        {:ok, handle}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  @doc """
-  Run an agent session to completion, emitting events via callback.
-
-  This is the main execution function. It reads from the port until the
-  agent process exits, parsing and emitting events along the way.
-
-  Returns `{:ok, result}` on successful completion or `{:error, reason}` on failure.
-  """
-  @spec run(handle(), keyword()) :: {:ok, map()} | {:error, term()}
-  def run(handle, opts \\ []) do
-    on_event = Keyword.get(opts, :on_event, &default_on_event/1)
-    timeout_ms = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
-
-    receive_loop(handle, on_event, timeout_ms, "")
-  end
-
-  @doc "Stop an agent session by closing the port."
-  @spec stop(handle()) :: :ok
-  def stop(%{port: port}) when is_port(port) do
-    case :erlang.port_info(port) do
-      :undefined ->
-        :ok
-
-      _ ->
-        try do
-          Port.close(port)
-          :ok
-        rescue
-          ArgumentError -> :ok
-        end
-    end
-  end
-
-  def stop(_handle), do: :ok
-
-  # -- Port management --
-
-  defp spawn_port(workspace, command) do
-    bash = System.find_executable("bash")
-
-    if is_nil(bash) do
-      {:error, :bash_not_found}
-    else
-      port =
-        Port.open(
-          {:spawn_executable, String.to_charlist(bash)},
-          [
-            :binary,
-            :exit_status,
-            :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(command)],
-            cd: String.to_charlist(workspace),
-            line: @port_line_bytes
-          ]
-        )
-
-      {:ok, port}
-    end
-  end
-
-  # -- Event stream processing --
-
-  defp receive_loop(handle, on_event, timeout_ms, pending_line) do
-    %{port: port, adapter: adapter} = handle
-
-    receive do
-      {^port, {:data, {:eol, chunk}}} ->
-        complete_line = pending_line <> to_string(chunk)
-        handle = process_line(handle, complete_line, on_event)
-        receive_loop(handle, on_event, timeout_ms, "")
-
-      {^port, {:data, {:noeol, chunk}}} ->
-        receive_loop(handle, on_event, timeout_ms, pending_line <> to_string(chunk))
-
-      {^port, {:exit_status, 0}} ->
-        emit(on_event, Event.system(:exit, %{code: 0, status: :success}), handle)
-        {:ok, %{session_id: handle.session_id, status: :completed, exit_code: 0}}
-
-      {^port, {:exit_status, code}} ->
-        emit(on_event, Event.system(:exit, %{code: code, status: :failed}), handle)
-        {:error, {:exit_code, code}}
-    after
-      timeout_ms ->
-        Logger.warning("#{adapter.agent_name()} session timed out after #{timeout_ms}ms")
-        stop(handle)
-        emit(on_event, Event.system(:timeout, %{timeout_ms: timeout_ms}), handle)
-        {:error, :session_timeout}
-    end
-  end
-
-  defp process_line(handle, line, on_event) do
-    %{adapter: adapter} = handle
-
-    case Jason.decode(line) do
-      {:ok, raw} when is_map(raw) ->
-        handle = maybe_capture_session_id(handle, adapter, raw)
-        maybe_emit_event(handle, adapter, raw, on_event)
-        handle
-
-      {:error, _reason} ->
-        log_non_json_line(line, adapter)
-        handle
-    end
-  end
-
-  defp maybe_capture_session_id(%{session_id: nil} = handle, adapter, raw) do
-    case adapter.extract_session_id(raw) do
-      {:ok, session_id} ->
-        Logger.info("#{adapter.agent_name()} session ID: #{session_id}")
-        %{handle | session_id: session_id}
-
-      :not_found ->
-        handle
-    end
-  end
-
-  defp maybe_capture_session_id(handle, _adapter, _raw), do: handle
-
-  defp maybe_emit_event(handle, adapter, raw, on_event) do
-    case adapter.parse_event(raw) do
-      {:ok, event} ->
-        emit(on_event, event, handle)
-
-      {:ok_multi, events} when is_list(events) ->
-        Enum.each(events, fn event -> emit(on_event, event, handle) end)
-
-      {:skip, _reason} ->
-        :ok
-
-      {:error, reason} ->
-        Logger.debug("#{adapter.agent_name()} event parse error: #{inspect(reason)}")
-    end
-  end
-
-  defp emit(on_event, event, handle) do
-    event = %{event | session_id: handle.session_id}
-    on_event.(event)
-  end
-
-  defp log_non_json_line(line, adapter) do
-    text = line |> to_string() |> String.trim() |> String.slice(0, 500)
-
-    if text != "" do
-      if String.match?(text, ~r/\b(error|warn|warning|failed|fatal|panic|exception)\b/i) do
-        Logger.warning("#{adapter.agent_name()} stderr: #{text}")
-      else
-        Logger.debug("#{adapter.agent_name()} output: #{text}")
-      end
-    end
-  end
-
-  # -- Adapter resolution --
-
-  defp write_prompt_file(workspace, prompt) do
-    prompt_dir = Path.join(workspace, ".symphony")
-    File.mkdir_p!(prompt_dir)
-    prompt_file = Path.join(prompt_dir, "prompt.txt")
-    File.write!(prompt_file, prompt)
-    prompt_file
-  end
-
-  defp resolve_adapter(opts) do
+  @spec run_session(Path.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def run_session(workspace, prompt, opts \\ []) do
     backend = Keyword.get_lazy(opts, :backend, fn -> default_backend() end)
+    on_event = Keyword.get(opts, :on_event, &default_on_event/1)
+    config = Config.settings!()
 
     case backend do
-      b when b in ["claude", :claude] -> Adapters.Claude
-      b when b in ["codex", :codex] -> Adapters.Codex
-      module when is_atom(module) -> module
-      other -> raise ArgumentError, "Unknown agent backend: #{inspect(other)}"
+      b when b in ["claude", :claude] ->
+        run_claude_session(workspace, prompt, config, on_event, opts)
+
+      _ ->
+        {:error, {:unsupported_backend, backend}}
     end
   end
+
+  # -- Claude Code SDK execution --
+
+  defp run_claude_session(workspace, prompt, config, on_event, _opts) do
+    Logger.info("Starting Claude Code session in #{workspace}")
+
+    # Emit init event
+    on_event.(Event.system(:init, %{workspace: workspace, backend: "claude"}))
+
+    sdk_opts = [
+      max_turns: config.agent.max_turns,
+      cwd: workspace,
+      allowed_tools: config.agent.allowed_tools,
+      permissions: %{allow: ["*"], deny: []},
+      system_prompt: "",
+      output_format: :stream_json
+    ]
+
+    session_id = nil
+
+    case ClaudeCode.run(prompt, sdk_opts) do
+      {:ok, messages} when is_list(messages) ->
+        # Process all messages and emit events
+        session_id = extract_session_id_from_messages(messages)
+
+        for msg <- messages do
+          events = message_to_events(msg)
+          for event <- events do
+            event = %{event | session_id: session_id}
+            on_event.(event)
+          end
+        end
+
+        on_event.(Event.system(:done, %{status: :success, session_id: session_id}))
+
+        {:ok, %{session_id: session_id, status: :completed}}
+
+      {:error, reason} ->
+        Logger.error("Claude Code session failed: #{inspect(reason)}")
+        on_event.(Event.error(reason))
+        {:error, reason}
+    end
+  rescue
+    e ->
+      Logger.error("Claude Code session crashed: #{Exception.message(e)}")
+      on_event.(Event.error(Exception.message(e)))
+      {:error, {:crash, Exception.message(e)}}
+  end
+
+  # -- Message to Event conversion --
+
+  defp message_to_events(%{role: :assistant, content: content}) when is_list(content) do
+    Enum.flat_map(content, fn
+      %{type: :text, text: text} ->
+        [%Event{type: :assistant, content: %{message: text}, raw: nil, timestamp: DateTime.utc_now()}]
+
+      %{type: :tool_use, name: name, input: input} ->
+        [%Event{type: :tool_use, content: %{tool: name, input: input || %{}}, raw: nil, timestamp: DateTime.utc_now()}]
+
+      %{type: :tool_result, content: result_content} ->
+        output = extract_tool_result_text(result_content)
+        [%Event{type: :tool_result, content: %{tool: "tool", output: output, success: true}, raw: nil, timestamp: DateTime.utc_now()}]
+
+      _ ->
+        []
+    end)
+  end
+
+  defp message_to_events(%{role: :user, content: content}) when is_list(content) do
+    Enum.flat_map(content, fn
+      %{type: :tool_result, content: result_content} ->
+        output = extract_tool_result_text(result_content)
+        [%Event{type: :tool_result, content: %{tool: "tool", output: String.slice(output, 0, 500), success: true}, raw: nil, timestamp: DateTime.utc_now()}]
+
+      _ ->
+        []
+    end)
+  end
+
+  # Handle raw map format (the SDK may return different shapes)
+  defp message_to_events(%{"type" => "assistant", "message" => %{"content" => content}}) when is_list(content) do
+    Enum.flat_map(content, fn
+      %{"type" => "text", "text" => text} ->
+        [%Event{type: :assistant, content: %{message: text}, raw: nil, timestamp: DateTime.utc_now()}]
+
+      %{"type" => "tool_use", "name" => name, "input" => input} ->
+        [%Event{type: :tool_use, content: %{tool: name, input: input || %{}}, raw: nil, timestamp: DateTime.utc_now()}]
+
+      _ ->
+        []
+    end)
+  end
+
+  defp message_to_events(%{"type" => "result"} = msg) do
+    [%Event{
+      type: :system,
+      content: %{
+        subtype: :result,
+        result: Map.get(msg, "result"),
+        cost_usd: Map.get(msg, "total_cost_usd"),
+        duration_ms: Map.get(msg, "duration_ms"),
+        total_turns: Map.get(msg, "num_turns")
+      },
+      raw: msg,
+      timestamp: DateTime.utc_now()
+    }]
+  end
+
+  defp message_to_events(_msg), do: []
+
+  defp extract_tool_result_text(content) when is_list(content) do
+    content
+    |> Enum.map(fn
+      %{type: :text, text: text} -> text
+      %{"type" => "text", "text" => text} -> text
+      other -> inspect(other)
+    end)
+    |> Enum.join("\n")
+  end
+
+  defp extract_tool_result_text(content) when is_binary(content), do: content
+  defp extract_tool_result_text(content), do: inspect(content)
+
+  defp extract_session_id_from_messages(messages) do
+    Enum.find_value(messages, fn
+      %{session_id: id} when is_binary(id) -> id
+      %{"session_id" => id} when is_binary(id) -> id
+      _ -> nil
+    end)
+  end
+
+  # -- Helpers --
 
   defp default_backend do
     try do
@@ -295,7 +188,7 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
   end
 
   defp default_on_event(event) do
-    Logger.debug("Agent event: #{inspect(event.type)} #{inspect(event.content)}")
+    Logger.debug("Agent event: #{inspect(event.type)}")
     :ok
   end
 end
