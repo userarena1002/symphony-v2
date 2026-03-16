@@ -6,6 +6,7 @@ tracker:
   active_states:
     - Todo
     - In Progress
+    - Edit
     - Merging
     - Rework
   terminal_states:
@@ -173,8 +174,9 @@ The `.codex/skills/` directory contains workflow skills. Use them by reading the
 - `Todo` -> queued; Symphony moves to `In Progress` on dispatch.
 - `In Progress` -> implementation actively underway.
 - `Human Review` -> PR is attached and validated; Symphony moves here on completion.
+- `Edit` -> reviewer wants small changes; Symphony resumes in the SAME workspace with reviewer comments as the prompt. Makes targeted changes, re-pushes, and returns to Human Review.
 - `Merging` -> approved by human; execute the `land` skill flow.
-- `Rework` -> reviewer requested changes; planning + implementation required.
+- `Rework` -> reviewer requested changes; full re-implementation required.
 - `Done` -> terminal state; no further action required.
 
 ## Execution requirements

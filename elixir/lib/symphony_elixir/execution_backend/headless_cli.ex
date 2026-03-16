@@ -139,19 +139,42 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
   end
 
   # -- Complete assistant message (uses parsed Content structs) --
-  defp message_to_events(%AssistantMessage{message: %{content: content}}) when is_list(content) do
-    Enum.flat_map(content, fn
+  defp message_to_events(%AssistantMessage{message: %{content: content, usage: usage}} = _msg) when is_list(content) do
+    events = Enum.flat_map(content, fn
       %TextBlock{text: text} when is_binary(text) and text != "" ->
         [Event.assistant(text)]
 
       %ToolUseBlock{name: name, input: input} ->
         [Event.tool_use(name, input || %{})]
 
-      # Fallback for map content
       %{type: :text, text: text} when is_binary(text) and text != "" ->
         [Event.assistant(text)]
 
       %{type: :tool_use, name: name, input: input} ->
+        [Event.tool_use(name, input || %{})]
+
+      _ ->
+        []
+    end)
+
+    # Attach usage data to the first event so the orchestrator can track tokens
+    case {events, usage} do
+      {[first | rest], %{} = u} ->
+        first_with_usage = %{first | content: Map.put(first.content, :usage, u)}
+        [first_with_usage | rest]
+
+      _ ->
+        events
+    end
+  end
+
+  # Fallback when usage is nil
+  defp message_to_events(%AssistantMessage{message: %{content: content}}) when is_list(content) do
+    Enum.flat_map(content, fn
+      %TextBlock{text: text} when is_binary(text) and text != "" ->
+        [Event.assistant(text)]
+
+      %ToolUseBlock{name: name, input: input} ->
         [Event.tool_use(name, input || %{})]
 
       _ ->

@@ -1171,6 +1171,7 @@ defmodule SymphonyElixir.Orchestrator do
     running_entry
     |> maybe_update_session_id(event)
     |> maybe_update_timestamp(event)
+    |> maybe_update_tokens(event)
     |> Map.put(:last_event_type, event.type)
   end
 
@@ -1185,6 +1186,22 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_update_timestamp(entry, _event), do: entry
+
+  # Extract token counts from result events (SDK provides total usage on completion)
+  defp maybe_update_tokens(entry, %Event{type: :system, content: %{subtype: :result, cost_usd: cost}})
+       when is_number(cost) do
+    Map.put(entry, :cost_usd, cost)
+  end
+
+  # Track cumulative tokens from assistant message usage data
+  defp maybe_update_tokens(entry, %Event{type: :assistant, content: %{usage: usage}})
+       when is_map(usage) do
+    input = Map.get(usage, :input_tokens) || Map.get(usage, "input_tokens", 0)
+    output = Map.get(usage, :output_tokens) || Map.get(usage, "output_tokens", 0)
+    Map.put(entry, :total_tokens, input + output)
+  end
+
+  defp maybe_update_tokens(entry, _event), do: entry
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
     if is_reference(state.tick_timer_ref) do

@@ -36,6 +36,11 @@ defmodule SymphonyElixir.Tracker do
     adapter().update_issue_state(issue_id, state_name)
   end
 
+  @spec fetch_issue_comments(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  def fetch_issue_comments(issue_id, opts \\ []) do
+    SymphonyElixir.Linear.Client.fetch_issue_comments(issue_id, opts)
+  end
+
   @spec adapter() :: module()
   def adapter do
     case Config.settings!().tracker.kind do

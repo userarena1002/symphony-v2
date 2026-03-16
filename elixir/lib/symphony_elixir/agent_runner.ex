@@ -72,7 +72,10 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_agent_session(workspace, issue, orchestrator_pid, opts) do
     config = Config.settings!()
-    prompt = PromptBuilder.build_prompt(issue, opts)
+
+    # Build prompt based on issue state — Edit state gets a special prompt
+    # that includes reviewer comments and focuses on tweaks, not full implementation
+    prompt = build_session_prompt(issue, opts)
 
     on_event = build_event_handler(issue, orchestrator_pid)
 
@@ -100,6 +103,78 @@ defmodule SymphonyElixir.AgentRunner do
         Logger.warning("Agent session ended with error for #{issue_context(issue)}: #{inspect(reason)}")
         {:error, reason}
     end
+  end
+
+  # -- Prompt building --
+
+  defp build_session_prompt(%Issue{state: "Edit"} = issue, opts) do
+    # Edit state: fetch reviewer comments and build a focused edit prompt
+    base_prompt = PromptBuilder.build_prompt(issue, opts)
+    comments = fetch_reviewer_comments(issue)
+
+    if comments == [] do
+      # No comments — fall back to standard prompt
+      base_prompt
+    else
+      edit_prompt(issue, comments, base_prompt)
+    end
+  end
+
+  defp build_session_prompt(issue, opts) do
+    PromptBuilder.build_prompt(issue, opts)
+  end
+
+  defp fetch_reviewer_comments(%Issue{id: issue_id}) do
+    case Tracker.fetch_issue_comments(issue_id) do
+      {:ok, comments} -> comments
+      {:error, _reason} -> []
+    end
+  end
+
+  defp edit_prompt(issue, comments, _base_prompt) do
+    comment_text =
+      comments
+      |> Enum.map(fn c ->
+        author = get_in(c, ["user", "name"]) || "Reviewer"
+        body = c["body"] || ""
+        "**#{author}** (#{c["createdAt"]}):\n#{body}"
+      end)
+      |> Enum.join("\n\n---\n\n")
+
+    """
+    You are resuming work on issue #{issue.identifier}: #{issue.title}
+
+    This issue was previously implemented and is now in the Edit state because
+    the reviewer has requested changes. The workspace already contains your
+    previous work on branch #{issue.identifier}.
+
+    ## Reviewer feedback
+
+    The following comments were left on the ticket. Read them carefully and
+    make the requested changes:
+
+    #{comment_text}
+
+    ## Instructions
+
+    1. You are in the SAME workspace as before. The code changes from the
+       previous session are already here.
+    2. Read the reviewer feedback above and make ONLY the requested changes.
+    3. Do not redo work that wasn't mentioned in the feedback.
+    4. After making changes:
+       - Run `npm run typecheck` to validate
+       - Commit the changes with a clear message referencing the feedback
+       - Push the branch (it already exists on the remote)
+       - Update the PR if needed
+    5. Post a Linear comment summarizing what you changed:
+       ```
+       [Agent] Edit complete - applied reviewer feedback
+       - Changes: <what you changed>
+       - Validation: npm run typecheck passed
+       ```
+
+    Keep this focused and fast. The reviewer is waiting.
+    """
   end
 
   # -- Event handling --

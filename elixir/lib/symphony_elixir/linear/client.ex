@@ -160,6 +160,59 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
+  @doc "Fetch comments for an issue, optionally filtered by a since timestamp."
+  @spec fetch_issue_comments(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  def fetch_issue_comments(issue_id, opts \\ []) when is_binary(issue_id) do
+    since = Keyword.get(opts, :since)
+
+    query = """
+    query IssueComments($issueId: String!) {
+      issue(id: $issueId) {
+        comments(first: 50, orderBy: createdAt) {
+          nodes {
+            id
+            body
+            createdAt
+            user {
+              name
+              email
+            }
+          }
+        }
+      }
+    }
+    """
+
+    case graphql(query, %{"issueId" => issue_id}) do
+      {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => comments}}}}} ->
+        filtered =
+          if since do
+            Enum.filter(comments, fn c ->
+              case DateTime.from_iso8601(c["createdAt"]) do
+                {:ok, dt, _} -> DateTime.compare(dt, since) == :gt
+                _ -> true
+              end
+            end)
+          else
+            comments
+          end
+
+        # Filter out agent comments (posted by our own automation)
+        user_comments = Enum.reject(filtered, fn c ->
+          body = c["body"] || ""
+          String.starts_with?(body, "[Agent]")
+        end)
+
+        {:ok, user_comments}
+
+      {:ok, _unexpected} ->
+        {:ok, []}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   @spec graphql(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def graphql(query, variables \\ %{}, opts \\ [])
       when is_binary(query) and is_map(variables) and is_list(opts) do
