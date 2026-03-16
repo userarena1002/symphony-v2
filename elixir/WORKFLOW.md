@@ -113,32 +113,31 @@ post_linear_comment() {
 
 Post a comment at each of these milestones:
 
-1. **Work started** — when you begin working, post a brief comment:
+1. **Work started** -- when you begin working, post a brief comment:
    ```
-   🔧 **Agent started work on {{ issue.identifier }}**
-   - Branch: `USE-XX`
-   - Workspace: `<path>`
+   [Agent] Started work on {{ issue.identifier }}
+   - Branch: USE-XX
    - Plan: <1-2 sentence summary of approach>
    ```
 
-2. **Implementation complete** — after code changes are done and validated:
+2. **Implementation complete** -- after code changes are done and validated:
    ```
-   ✅ **Implementation complete**
+   [Agent] Implementation complete
    - Files changed: <list of key files modified>
    - Approach: <brief description of what was changed and why>
-   - Validation: `npm run typecheck` passed
+   - Validation: npm run typecheck passed
    ```
 
-3. **Ready for review** — when PR is created and preview is running:
+3. **Ready for review** -- when PR is created and preview is running:
    ```
-   👀 **Ready for human review**
+   [Agent] Ready for human review
    - PR: <PR URL>
    - Preview: <preview URL if available>
    - What to test: <specific route or interaction to verify>
    - What changed: <concise summary of the changes>
    ```
 
-If you encounter blockers, post a comment explaining what's blocked and why.
+If you encounter blockers, post a comment explaining what is blocked and why.
 
 ## Repository posture
 
@@ -226,20 +225,20 @@ The `.codex/skills/` directory contains workflow skills. Use them by reading the
 - Make clean, focused commits using the `commit` skill.
 - Push the branch and create a PR using the `push` skill.
 - The PR title should include the issue identifier and a brief description.
-- Always push your work before the session ends — unpushed work is invisible to reviewers.
+- Always push your work before the session ends -unpushed work is invisible to reviewers.
 
 ## CRITICAL: Completion checklist
 
 You MUST complete ALL of the following before your session ends. Do not exit
 until every item is done. This is not optional.
 
-1. **Code changes** — implement the ticket requirements
-2. **Validation** — run `npm run typecheck` and confirm it passes
-3. **Commit** — stage and commit all changes with a clear message
-4. **Push** — push the branch to origin (read `.codex/skills/push/SKILL.md`)
-5. **Pull request** — create a PR using `gh pr create` with the issue identifier in the title
-6. **Preview server** — if `./scripts/start-preview-detached.sh` exists, start a detached preview server on a unique port and note the URL in the workpad
-7. **Workpad** — update `.symphony/workpad.md` with final status
+1. **Code changes** -implement the ticket requirements
+2. **Validation** -run `npm run typecheck` and confirm it passes
+3. **Commit** -stage and commit all changes with a clear message
+4. **Push** -push the branch to origin (read `.codex/skills/push/SKILL.md`)
+5. **Pull request** -create a PR using `gh pr create` with the issue identifier in the title
+6. **Preview server** -if `./scripts/start-preview-detached.sh` exists, start a detached preview server on a unique port and note the URL in the workpad
+7. **Workpad** -update `.symphony/workpad.md` with final status
 
 If you are running low on context or turns, prioritize in this order:
-commit → push → PR → everything else. Unpushed code is lost work.
+commit > push > PR > everything else. Unpushed code is lost work.
