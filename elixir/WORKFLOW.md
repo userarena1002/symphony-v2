@@ -90,16 +90,55 @@ Symphony handles Linear state transitions automatically:
 
 You do NOT need to update the Linear issue state. Focus on the code work.
 
-If you need to add a comment to the Linear issue, use the `gh` CLI or `curl` with
-the Linear GraphQL API. The LINEAR_API_KEY environment variable is available.
+### Posting comments to Linear
 
-Example to add a comment:
+You MUST post comments to the Linear ticket at key milestones so the reviewer
+can track progress without looking at the code. Use the following bash function
+to post comments. The `LINEAR_API_KEY` environment variable is available.
+
 ```bash
-curl -s -X POST https://api.linear.app/graphql \
-  -H "Content-Type: application/json" \
-  -H "Authorization: $LINEAR_API_KEY" \
-  -d '{"query": "mutation { commentCreate(input: { issueId: \"<issue_id>\", body: \"Your comment\" }) { success } }"}'
+post_linear_comment() {
+  local ISSUE_ID="{{ issue.id }}"
+  local BODY="$1"
+  # Escape the body for JSON
+  local ESCAPED_BODY=$(echo "$BODY" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
+  curl -s -X POST https://api.linear.app/graphql \
+    -H "Content-Type: application/json" \
+    -H "Authorization: $LINEAR_API_KEY" \
+    -d "{\"query\": \"mutation { commentCreate(input: { issueId: \\\"$ISSUE_ID\\\", body: \\\"$ESCAPED_BODY\\\" }) { success comment { id } } }\"}"
+}
 ```
+
+### Required Linear comments
+
+Post a comment at each of these milestones:
+
+1. **Work started** — when you begin working, post a brief comment:
+   ```
+   🔧 **Agent started work on {{ issue.identifier }}**
+   - Branch: `USE-XX`
+   - Workspace: `<path>`
+   - Plan: <1-2 sentence summary of approach>
+   ```
+
+2. **Implementation complete** — after code changes are done and validated:
+   ```
+   ✅ **Implementation complete**
+   - Files changed: <list of key files modified>
+   - Approach: <brief description of what was changed and why>
+   - Validation: `npm run typecheck` passed
+   ```
+
+3. **Ready for review** — when PR is created and preview is running:
+   ```
+   👀 **Ready for human review**
+   - PR: <PR URL>
+   - Preview: <preview URL if available>
+   - What to test: <specific route or interaction to verify>
+   - What changed: <concise summary of the changes>
+   ```
+
+If you encounter blockers, post a comment explaining what's blocked and why.
 
 ## Repository posture
 
