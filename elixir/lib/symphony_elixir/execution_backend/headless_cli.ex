@@ -109,26 +109,20 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
   #   UserMessage — tool results
   #   ResultMessage — session complete
 
-  # -- Partial messages: real-time streaming content --
+  # -- Partial messages: only emit tool starts, skip text deltas --
+  # Text deltas cause massive duplication in the dashboard (every character
+  # chunk shows as a separate event). The full text arrives with AssistantMessage.
 
   defp message_to_events(%PartialAssistantMessage{event: event} = _msg) do
     case event do
+      # Tool use starting — useful to show "agent is now calling Read/Edit/Bash"
       %{type: :content_block_start, content_block: %{type: :tool_use, name: name}} ->
         [Event.tool_use(name, %{})]
 
-      %{type: :content_block_start, content_block: %{type: :text, text: text}} when text != "" ->
-        [Event.assistant(text)]
-
-      %{type: :content_block_delta, delta: %{type: :text_delta, text: text}} when is_binary(text) and text != "" ->
-        [Event.assistant(text)]
-
-      # Also handle string-key variants
       %{"type" => "content_block_start", "content_block" => %{"type" => "tool_use", "name" => name}} ->
         [Event.tool_use(name, %{})]
 
-      %{"type" => "content_block_delta", "delta" => %{"type" => "text_delta", "text" => text}} when is_binary(text) and text != "" ->
-        [Event.assistant(text)]
-
+      # Skip all text deltas — full text comes with AssistantMessage
       _ ->
         []
     end
