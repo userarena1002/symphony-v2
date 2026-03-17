@@ -691,19 +691,39 @@ defmodule SymphonyElixir.Orchestrator do
       end
     end
 
+    # For new Todo issues, consult the Router to see if we should reuse an idle session
+    routing = if issue.state == "Todo" do
+      try do
+        SymphonyElixir.Router.route(issue)
+      rescue
+        e ->
+          Logger.warning("Router failed: #{Exception.message(e)}, starting fresh")
+          %{action: :new_session, session_id: nil, workspace_path: nil, reasoning: "Router error"}
+      end
+    else
+      %{action: :new_session, session_id: nil, workspace_path: nil, reasoning: "Not a Todo issue"}
+    end
+
     case select_worker_host(state, preferred_worker_host) do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, routing)
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, routing \\ %{}) do
+    runner_opts = [
+      attempt: attempt,
+      worker_host: worker_host,
+      resume_session_id: routing[:session_id],
+      workspace_override: routing[:workspace_path]
+    ]
+
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient, runner_opts)
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)

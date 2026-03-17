@@ -10,7 +10,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
 
-  alias SymphonyElixir.{Config, EventBus, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, EventBus, Linear.Issue, PromptBuilder, SessionRegistry, Tracker, Workspace}
   alias SymphonyElixir.ExecutionBackend.HeadlessCLI
 
   @type worker_host :: String.t() | nil
@@ -51,16 +51,33 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, orchestrator_pid, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
+    # Router may provide a workspace from a different issue to reuse
+    workspace_override = Keyword.get(opts, :workspace_override)
+
+    workspace_result = if workspace_override && File.dir?(workspace_override) do
+      Logger.info("Using routed workspace: #{workspace_override} for #{issue_context(issue)}")
+      {:ok, workspace_override}
+    else
+      Workspace.create_for_issue(issue, worker_host)
+    end
+
+    case workspace_result do
       {:ok, workspace} ->
         send_worker_runtime_info(orchestrator_pid, issue, worker_host, workspace)
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+          # Skip hooks for routed workspaces (already set up from prior issue)
+          if workspace_override do
             run_agent_session(workspace, issue, orchestrator_pid, opts)
+          else
+            with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+              run_agent_session(workspace, issue, orchestrator_pid, opts)
+            end
           end
         after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+          unless workspace_override do
+            Workspace.run_after_run_hook(workspace, issue, worker_host)
+          end
         end
 
       {:error, reason} ->
@@ -83,15 +100,24 @@ defmodule SymphonyElixir.AgentRunner do
 
     on_event = build_event_handler(issue, orchestrator_pid)
 
-    # For Edit state, resume the previous Claude session to preserve context
-    resume_id = if issue.state == "Edit" do
-      HeadlessCLI.load_session_id(workspace)
-    else
-      nil
-    end
+    # Determine if we should resume an existing session:
+    # 1. Edit state: resume the same issue's last session
+    # 2. Router decision: resume an idle session from a different issue
+    # 3. Otherwise: fresh session
+    routed_resume_id = Keyword.get(opts, :resume_session_id)
 
-    if resume_id do
-      Logger.info("Resuming session #{resume_id} for #{issue_context(issue)} (Edit mode)")
+    resume_id = cond do
+      issue.state == "Edit" ->
+        sid = HeadlessCLI.load_session_id(workspace)
+        if sid, do: Logger.info("Resuming session #{sid} for #{issue_context(issue)} (Edit mode)")
+        sid
+
+      is_binary(routed_resume_id) ->
+        Logger.info("Router assigned session #{routed_resume_id} for #{issue_context(issue)}")
+        routed_resume_id
+
+      true ->
+        nil
     end
 
     cli_opts = [
@@ -100,11 +126,37 @@ defmodule SymphonyElixir.AgentRunner do
       resume_session_id: resume_id
     ]
 
+    # Record session start in registry
+    session_id_ref = make_ref() |> inspect()
+    SessionRegistry.create_session(%{
+      id: session_id_ref,
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      workspace_path: workspace,
+      status: "running",
+      started_at: DateTime.utc_now()
+    })
+
     case HeadlessCLI.run_session(workspace, prompt, cli_opts) do
       {:ok, result} ->
-        Logger.info("Agent session completed for #{issue_context(issue)} session_id=#{result[:session_id]}")
+        actual_sid = result[:session_id] || session_id_ref
+        Logger.info("Agent session completed for #{issue_context(issue)} session_id=#{actual_sid}")
 
-        # Move issue to the appropriate next state based on what we were doing
+        # Record completion in registry with summary
+        SessionRegistry.complete_session(actual_sid, %{
+          id: actual_sid,
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          workspace_path: workspace,
+          status: "succeeded",
+          started_at: DateTime.utc_now(),
+          completed_at: DateTime.utc_now()
+        })
+
+        # Generate heuristic summary from file touches + workpad
+        SessionRegistry.generate_heuristic_summary(actual_sid, workspace)
+
+        # Move issue to the appropriate next state
         next_state = if issue.state == "Merging", do: "Done", else: "Human Review"
 
         case Tracker.update_issue_state(issue.id, next_state) do
@@ -119,6 +171,19 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:error, reason} ->
         Logger.warning("Agent session ended with error for #{issue_context(issue)}: #{inspect(reason)}")
+
+        # Record failure
+        SessionRegistry.complete_session(session_id_ref, %{
+          id: session_id_ref,
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          workspace_path: workspace,
+          status: "failed",
+          started_at: DateTime.utc_now(),
+          completed_at: DateTime.utc_now(),
+          error: inspect(reason)
+        })
+
         {:error, reason}
     end
   end
@@ -264,16 +329,18 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp build_event_handler(%Issue{id: issue_id} = issue, orchestrator_pid) do
     fn event ->
-      # Attach issue context to the event
       event = %{event | issue_id: issue_id}
-
-      Logger.info("Agent event for #{issue_id}: type=#{event.type} content=#{inspect(Map.keys(event.content))}")
 
       # Broadcast through EventBus for dashboard/memory/logs
       EventBus.broadcast_event(issue_id, event)
 
-      # Also send to orchestrator for state tracking (session_id, timestamps)
+      # Send to orchestrator for state tracking
       send_orchestrator_update(orchestrator_pid, issue, event)
+
+      # Record file touches in session registry for the router
+      if event.session_id do
+        SessionRegistry.record_event(event.session_id, event)
+      end
 
       :ok
     end
