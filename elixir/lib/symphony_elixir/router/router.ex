@@ -2,18 +2,13 @@ defmodule SymphonyElixir.Router do
   @moduledoc """
   Routes new issues to either a fresh session or an existing idle session.
 
-  Uses an LLM to make the decision based on the new issue context and
-  available idle sessions with their summaries. No scoring formula —
-  the LLM sees the full context and decides.
-
-  When routing to an idle session, the new issue is dispatched to the
-  same workspace and session ID, allowing the agent to resume with
-  full conversation context from the prior work.
+  Emits routing events through PubSub so the dashboard can visualize
+  the routing decision process in real-time.
   """
 
   require Logger
 
-  alias SymphonyElixir.{Config, SessionRegistry}
+  alias SymphonyElixir.{Config, EventBus, SessionRegistry}
   alias SymphonyElixir.Linear.Issue
 
   @type decision :: %{
@@ -23,22 +18,58 @@ defmodule SymphonyElixir.Router do
           reasoning: String.t()
         }
 
-  @doc """
-  Decide whether a new issue should start a fresh session or reuse an idle one.
-
-  Returns a decision map with the action, optional session_id to resume,
-  and the LLM's reasoning.
-  """
+  @doc "Route an issue. Emits events through PubSub for dashboard visualization."
   @spec route(Issue.t()) :: decision()
   def route(%Issue{} = issue) do
+    broadcast_routing(:started, issue, %{})
+
     idle_sessions = SessionRegistry.get_idle_sessions(max_age_days: 14, limit: 10)
 
     if idle_sessions == [] do
-      Logger.info("Router: no idle sessions available, starting fresh for #{issue.identifier}")
-      %{action: :new_session, session_id: nil, workspace_path: nil, reasoning: "No prior sessions available"}
+      decision = %{action: :new_session, session_id: nil, workspace_path: nil, reasoning: "No prior sessions available"}
+      broadcast_routing(:decided, issue, %{decision: decision, candidates: 0})
+      decision
     else
-      ask_llm(issue, idle_sessions)
+      broadcast_routing(:evaluating, issue, %{
+        candidates: length(idle_sessions),
+        sessions: Enum.map(idle_sessions, fn s ->
+          %{issue_identifier: s.issue_identifier, session_id: s.session_id,
+            files_modified: s.files_modified || [], codebase_areas: s.codebase_areas || []}
+        end)
+      })
+
+      decision = ask_llm(issue, idle_sessions)
+      broadcast_routing(:decided, issue, %{decision: decision, candidates: length(idle_sessions)})
+      decision
     end
+  end
+
+  # -- PubSub events for dashboard --
+
+  @routing_topic "router:events"
+
+  defp broadcast_routing(phase, issue, data) do
+    event = %{
+      phase: phase,
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      issue_title: issue.title,
+      timestamp: DateTime.utc_now(),
+      data: data
+    }
+
+    Phoenix.PubSub.broadcast(
+      SymphonyElixir.PubSub,
+      @routing_topic,
+      {:routing_event, event}
+    )
+  rescue
+    _ -> :ok
+  end
+
+  @spec subscribe_routing() :: :ok
+  def subscribe_routing do
+    Phoenix.PubSub.subscribe(SymphonyElixir.PubSub, @routing_topic)
   end
 
   # -- LLM decision --
@@ -48,7 +79,6 @@ defmodule SymphonyElixir.Router do
 
     Logger.info("Router: asking LLM to route #{issue.identifier} with #{length(idle_sessions)} candidates")
 
-    # Use a quick Claude session to make the routing decision
     case ClaudeCode.query(prompt, max_turns: 1, dangerously_skip_permissions: true) do
       {:ok, result} ->
         parse_decision(result, idle_sessions)
@@ -108,12 +138,10 @@ defmodule SymphonyElixir.Router do
   end
 
   defp parse_decision(result, idle_sessions) do
-    # Extract the text from the result
     text = extract_result_text(result)
 
     cond do
       String.contains?(text, "REUSE:") ->
-        # Extract session number
         case Regex.run(~r/REUSE:\s*(\d+)/, text) do
           [_, num_str] ->
             idx = String.to_integer(num_str) - 1
@@ -121,7 +149,7 @@ defmodule SymphonyElixir.Router do
 
             if session do
               reason = extract_reason(text)
-              Logger.info("Router: reusing session #{session.session_id} for #{session.issue_identifier} — #{reason}")
+              Logger.info("Router: reusing session #{session.session_id} for #{session.issue_identifier} - #{reason}")
 
               %{
                 action: :reuse_session,
@@ -139,7 +167,7 @@ defmodule SymphonyElixir.Router do
 
       String.contains?(text, "NEW") ->
         reason = extract_reason(text)
-        Logger.info("Router: starting fresh — #{reason}")
+        Logger.info("Router: starting fresh - #{reason}")
         %{action: :new_session, session_id: nil, workspace_path: nil, reasoning: reason}
 
       true ->

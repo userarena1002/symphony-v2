@@ -740,3 +740,236 @@ pre,
   border-color: var(--line);
   opacity: 0.85;
 }
+
+/* ---- Router visualization ---- */
+
+.router-section {
+  border-color: rgba(122, 162, 247, 0.3);
+  background: linear-gradient(180deg, rgba(122, 162, 247, 0.03) 0%, var(--card) 100%);
+}
+
+.router-events {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.router-event {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 0.75rem 1rem;
+  background: var(--page-soft);
+  animation: routerSlideIn 0.4s ease-out;
+}
+
+@keyframes routerSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.router-event-header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.router-phase-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.router-badge-started {
+  background: rgba(122, 162, 247, 0.12);
+  border: 1px solid rgba(122, 162, 247, 0.25);
+  color: #7aa2f7;
+  animation: routerPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes routerPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.router-badge-evaluating {
+  background: rgba(224, 175, 104, 0.12);
+  border: 1px solid rgba(224, 175, 104, 0.25);
+  color: #e0af68;
+  animation: routerPulse 1s ease-in-out infinite;
+}
+
+.router-badge-decided {
+  background: rgba(158, 206, 106, 0.12);
+  border: 1px solid rgba(158, 206, 106, 0.25);
+  color: #9ece6a;
+}
+
+.router-issue {
+  font-weight: 700;
+  font-size: 0.95rem;
+}
+
+.router-title {
+  font-size: 0.88rem;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.router-time {
+  font-size: 0.78rem;
+  flex-shrink: 0;
+}
+
+/* Candidate list */
+
+.router-candidates {
+  position: relative;
+  margin: 0.6rem 0 0 1.2rem;
+  padding-left: 1rem;
+}
+
+.router-flow-line {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: linear-gradient(180deg, rgba(224, 175, 104, 0.4) 0%, rgba(224, 175, 104, 0.1) 100%);
+  border-radius: 1px;
+}
+
+.router-candidate {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem 0;
+  font-size: 0.85rem;
+  animation: candidateFadeIn 0.3s ease-out both;
+}
+
+.router-candidate:nth-child(2) { animation-delay: 0.1s; }
+.router-candidate:nth-child(3) { animation-delay: 0.2s; }
+.router-candidate:nth-child(4) { animation-delay: 0.3s; }
+.router-candidate:nth-child(5) { animation-delay: 0.4s; }
+
+@keyframes candidateFadeIn {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.router-candidate-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #e0af68;
+  flex-shrink: 0;
+  margin-left: -1.3rem;
+}
+
+.router-candidate-id {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+/* Decision result */
+
+.router-decision {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.6rem;
+  padding: 0.7rem 1rem;
+  border-radius: 12px;
+  animation: decisionReveal 0.5s ease-out;
+}
+
+@keyframes decisionReveal {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.router-decision-reuse {
+  background: rgba(122, 162, 247, 0.08);
+  border: 1px solid rgba(122, 162, 247, 0.2);
+}
+
+.router-decision-new {
+  background: rgba(158, 206, 106, 0.08);
+  border: 1px solid rgba(158, 206, 106, 0.2);
+}
+
+.router-decision-icon {
+  width: 2.2rem;
+  height: 2.2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  flex-shrink: 0;
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.router-icon-reuse {
+  background: rgba(122, 162, 247, 0.15);
+  color: #7aa2f7;
+  border-radius: 50%;
+  width: 2.2rem;
+  height: 2.2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.3rem;
+}
+
+.router-icon-new {
+  background: rgba(158, 206, 106, 0.15);
+  color: #9ece6a;
+  border-radius: 50%;
+  width: 2.2rem;
+  height: 2.2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.4rem;
+}
+
+.router-decision-text {
+  min-width: 0;
+}
+
+.router-decision-text strong {
+  display: block;
+  font-size: 0.92rem;
+}
+
+.router-decision-text p {
+  margin: 0.15rem 0 0;
+  font-size: 0.85rem;
+}

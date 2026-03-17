@@ -29,10 +29,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:subscribed_issues, MapSet.new())
       |> assign(:completed_agents, [])
       |> assign(:known_running_ids, MapSet.new())
+      |> assign(:routing_events, [])
 
     if connected?(socket) do
       :ok = ObservabilityPubSub.subscribe()
       :ok = EventBus.subscribe_state()
+      :ok = SymphonyElixir.Router.subscribe_routing()
       schedule_runtime_tick()
     end
 
@@ -70,6 +72,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   @impl true
+  # Routing events from the Router
+  def handle_info({:routing_event, event}, socket) do
+    # Keep last 5 routing events, newest first
+    events = Enum.take([event | socket.assigns.routing_events], 5)
+    {:noreply, assign(socket, :routing_events, events)}
+  end
+
   def handle_info({:agent_event, event}, socket) do
     issue_id = event.issue_id
 
@@ -172,6 +181,66 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
           </article>
         </section>
+
+        <%!-- Router activity --%>
+        <%= if @routing_events != [] do %>
+          <section class="section-card router-section">
+            <div class="section-header">
+              <h2 class="section-title">Router</h2>
+            </div>
+            <div class="router-events">
+              <%= for event <- @routing_events do %>
+                <div class={"router-event router-phase-#{event.phase}"}>
+                  <div class="router-event-header">
+                    <span class={"router-phase-badge router-badge-#{event.phase}"}>
+                      <%= router_phase_label(event.phase) %>
+                    </span>
+                    <span class="router-issue"><%= event.issue_identifier %></span>
+                    <span class="router-title muted"><%= event.issue_title %></span>
+                    <span class="router-time mono muted"><%= format_event_time(event.timestamp) %></span>
+                  </div>
+
+                  <%= if event.phase == :evaluating do %>
+                    <div class="router-candidates">
+                      <div class="router-flow-line"></div>
+                      <%= for session <- (event.data[:sessions] || []) do %>
+                        <div class="router-candidate">
+                          <span class="router-candidate-dot"></span>
+                          <span class="router-candidate-id"><%= session.issue_identifier %></span>
+                          <span class="muted">
+                            <%= Enum.join(Enum.take(session.files_modified || [], 3), ", ") %>
+                          </span>
+                        </div>
+                      <% end %>
+                    </div>
+                  <% end %>
+
+                  <%= if event.phase == :decided do %>
+                    <div class={"router-decision #{if event.data[:decision][:action] == :reuse_session, do: "router-decision-reuse", else: "router-decision-new"}"}>
+                      <div class="router-decision-icon">
+                        <%= if event.data[:decision][:action] == :reuse_session do %>
+                          <span class="router-icon-reuse">&#x21BB;</span>
+                        <% else %>
+                          <span class="router-icon-new">+</span>
+                        <% end %>
+                      </div>
+                      <div class="router-decision-text">
+                        <strong>
+                          <%= if event.data[:decision][:action] == :reuse_session do %>
+                            Reusing existing session
+                          <% else %>
+                            Starting fresh session
+                          <% end %>
+                        </strong>
+                        <p class="muted"><%= event.data[:decision][:reasoning] %></p>
+                      </div>
+                    </div>
+                  <% end %>
+                </div>
+              <% end %>
+            </div>
+          </section>
+        <% end %>
 
         <%!-- Running agents --%>
         <section class="section-card">
@@ -438,6 +507,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp compact_session(nil), do: "pending"
   defp compact_session(id) when is_binary(id), do: String.slice(id, 0, 12) <> "..."
+
+  defp router_phase_label(:started), do: "ROUTING"
+  defp router_phase_label(:evaluating), do: "EVALUATING"
+  defp router_phase_label(:decided), do: "DECIDED"
+  defp router_phase_label(phase), do: to_string(phase) |> String.upcase()
 
   defp format_time_ago(%DateTime{} = completed, %DateTime{} = now) do
     seconds = max(DateTime.diff(now, completed, :second), 0)
