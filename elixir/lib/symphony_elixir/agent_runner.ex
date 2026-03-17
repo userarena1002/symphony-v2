@@ -104,13 +104,15 @@ defmodule SymphonyElixir.AgentRunner do
       {:ok, result} ->
         Logger.info("Agent session completed for #{issue_context(issue)} session_id=#{result[:session_id]}")
 
-        # Move issue to Human Review so the orchestrator stops redispatching
-        case Tracker.update_issue_state(issue.id, "Human Review") do
+        # Move issue to the appropriate next state based on what we were doing
+        next_state = if issue.state == "Merging", do: "Done", else: "Human Review"
+
+        case Tracker.update_issue_state(issue.id, next_state) do
           :ok ->
-            Logger.info("Moved #{issue_context(issue)} to Human Review")
+            Logger.info("Moved #{issue_context(issue)} to #{next_state}")
 
           {:error, reason} ->
-            Logger.warning("Failed to move #{issue_context(issue)} to Human Review: #{inspect(reason)}")
+            Logger.warning("Failed to move #{issue_context(issue)} to #{next_state}: #{inspect(reason)}")
         end
 
         :ok
@@ -122,6 +124,18 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   # -- Prompt building --
+
+  defp build_session_prompt(%Issue{state: "Merging"} = issue, _opts) do
+    Logger.info("BUILD MERGING PROMPT for #{issue.identifier}")
+    """
+    Issue #{issue.identifier} (#{issue.title}) has been approved and is ready to merge.
+
+    Read the land skill at `.codex/skills/land/SKILL.md` and follow its instructions
+    to squash-merge the PR into main.
+
+    You are on branch #{issue.identifier}. The PR already exists.
+    """
+  end
 
   defp build_session_prompt(%Issue{state: state} = issue, opts) when state in ["Edit", "edit"] do
     # Edit state: fetch reviewer comments and build a focused edit prompt
