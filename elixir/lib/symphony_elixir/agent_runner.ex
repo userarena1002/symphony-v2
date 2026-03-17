@@ -126,23 +126,28 @@ defmodule SymphonyElixir.AgentRunner do
       resume_session_id: resume_id
     ]
 
-    # Record session start in registry
-    session_id_ref = make_ref() |> inspect()
-    SessionRegistry.create_session(%{
-      id: session_id_ref,
-      issue_id: issue.id,
-      issue_identifier: issue.identifier,
-      workspace_path: workspace,
-      status: "running",
-      started_at: DateTime.utc_now()
-    })
+    # For Edit/resume: reuse the existing session record in the registry
+    # For new sessions: create a fresh record
+    is_continuation = resume_id != nil
+    session_id_ref = if is_continuation, do: resume_id, else: make_ref() |> inspect()
+
+    unless is_continuation do
+      SessionRegistry.create_session(%{
+        id: session_id_ref,
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        workspace_path: workspace,
+        status: "running",
+        started_at: DateTime.utc_now()
+      })
+    end
 
     case HeadlessCLI.run_session(workspace, prompt, cli_opts) do
       {:ok, result} ->
         actual_sid = result[:session_id] || session_id_ref
-        Logger.info("Agent session completed for #{issue_context(issue)} session_id=#{actual_sid}")
+        Logger.info("Agent session completed for #{issue_context(issue)} session_id=#{actual_sid} continuation=#{is_continuation}")
 
-        # Record completion in registry with summary
+        # Update the existing session record (not create a new one)
         SessionRegistry.complete_session(actual_sid, %{
           id: actual_sid,
           issue_id: issue.id,
@@ -153,7 +158,7 @@ defmodule SymphonyElixir.AgentRunner do
           completed_at: DateTime.utc_now()
         })
 
-        # Generate heuristic summary from file touches + workpad
+        # Regenerate summary (accumulates file touches from all runs)
         SessionRegistry.generate_heuristic_summary(actual_sid, workspace)
 
         # Move issue to the appropriate next state

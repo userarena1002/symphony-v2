@@ -428,7 +428,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
     completed_agents =
       if MapSet.size(finished_ids) > 0 do
-        # Build completed entries from the events we captured
         new_completed =
           finished_ids
           |> Enum.map(fn id ->
@@ -441,8 +440,26 @@ defmodule SymphonyElixirWeb.DashboardLive do
             }
           end)
 
-        # Prepend new completions, keep last 20
-        Enum.take(new_completed ++ socket.assigns.completed_agents, 20)
+        # Merge: if same issue_id already in completed, update it (don't duplicate)
+        existing = socket.assigns.completed_agents
+        merged = Enum.reduce(new_completed, existing, fn new_entry, acc ->
+          case Enum.find_index(acc, &(&1.issue_id == new_entry.issue_id)) do
+            nil ->
+              # New issue — prepend
+              [new_entry | acc]
+
+            idx ->
+              # Same issue — update in place (Edit continuation)
+              old = Enum.at(acc, idx)
+              updated = %{old |
+                completed_at: new_entry.completed_at,
+                event_count: old.event_count + new_entry.event_count
+              }
+              List.replace_at(acc, idx, updated)
+          end
+        end)
+
+        Enum.take(merged, 20)
       else
         socket.assigns.completed_agents
       end
