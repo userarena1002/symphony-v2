@@ -153,12 +153,19 @@ defmodule SymphonyElixir.AgentRunner do
       end)
       |> Enum.join("\n\n---\n\n")
 
+    # Gather workspace context so the agent knows what's already been done
+    workspace_context = gather_workspace_context(issue)
+
     """
     You are resuming work on issue #{issue.identifier}: #{issue.title}
 
     This issue was previously implemented and is now in the Edit state because
     the reviewer has requested changes. The workspace already contains your
     previous work on branch #{issue.identifier}.
+
+    ## What was already done
+
+    #{workspace_context}
 
     ## Reviewer feedback
 
@@ -169,16 +176,19 @@ defmodule SymphonyElixir.AgentRunner do
 
     ## Instructions
 
-    1. You are in the SAME workspace as before. The code changes from the
-       previous session are already here.
-    2. Read the reviewer feedback above and make ONLY the requested changes.
-    3. Do not redo work that wasn't mentioned in the feedback.
+    1. You are in the SAME workspace as before. Your previous code changes
+       are already committed on branch `#{issue.identifier}`.
+    2. Start by reading the specific files mentioned in the feedback.
+       Do NOT re-explore the whole codebase - you already did that.
+    3. Make ONLY the requested changes. Do not redo or refactor anything
+       that wasn't mentioned in the feedback.
     4. After making changes:
        - Run `npm run typecheck` to validate
        - Commit the changes with a clear message referencing the feedback
        - Push the branch (it already exists on the remote)
-       - Update the PR if needed
-    5. Post a Linear comment summarizing what you changed:
+       - The PR will update automatically
+    5. Post a Linear comment summarizing what you changed.
+       Use curl with the LINEAR_API_KEY environment variable:
        ```
        [Agent] Edit complete - applied reviewer feedback
        - Changes: <what you changed>
@@ -187,6 +197,47 @@ defmodule SymphonyElixir.AgentRunner do
 
     Keep this focused and fast. The reviewer is waiting.
     """
+  end
+
+  defp gather_workspace_context(issue) do
+    workspace = Path.join(
+      Path.expand(Config.settings!().workspace.root),
+      SymphonyElixir.PathSafety.safe_identifier(issue.identifier)
+    )
+
+    parts = []
+
+    # Read the workpad if it exists
+    workpad_path = Path.join(workspace, ".symphony/workpad.md")
+    parts = case File.read(workpad_path) do
+      {:ok, content} when content != "" ->
+        parts ++ ["### Previous workpad\n#{String.slice(content, 0, 2000)}"]
+      _ ->
+        parts
+    end
+
+    # Get git log to show what was committed
+    parts = case System.cmd("git", ["log", "--oneline", "-10", "--no-decorate"],
+                  cd: workspace, stderr_to_stdout: true) do
+      {output, 0} when output != "" ->
+        parts ++ ["### Git history\n```\n#{String.trim(output)}\n```"]
+      _ ->
+        parts
+    end
+
+    # Get list of changed files vs main
+    parts = case System.cmd("git", ["diff", "--name-only", "main...HEAD"],
+                  cd: workspace, stderr_to_stdout: true) do
+      {output, 0} when output != "" ->
+        parts ++ ["### Files changed vs main\n```\n#{String.trim(output)}\n```"]
+      _ ->
+        parts
+    end
+
+    case parts do
+      [] -> "No workspace context available. Read the git log and changed files to understand what was previously done."
+      _ -> Enum.join(parts, "\n\n")
+    end
   end
 
   # -- Event handling --
