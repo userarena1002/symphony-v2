@@ -207,10 +207,9 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp gather_workspace_context(issue) do
-    workspace = Path.join(
-      Path.expand(Config.settings!().workspace.root),
-      SymphonyElixir.PathSafety.safe_identifier(issue.identifier)
-    )
+    # Sanitize identifier for directory name (same logic as Workspace module)
+    safe_id = String.replace(issue.identifier, ~r/[^A-Za-z0-9._-]/, "_")
+    workspace = Path.join(Path.expand(Config.settings!().workspace.root), safe_id)
 
     parts = []
 
