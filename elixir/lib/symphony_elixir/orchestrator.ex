@@ -679,7 +679,9 @@ defmodule SymphonyElixir.Orchestrator do
     recipient = self()
 
     # Move issue to "In Progress" on Linear when dispatching
-    if issue.state != "In Progress" do
+    # BUT: don't transition Edit issues — the AgentRunner needs to see state="Edit"
+    # to build the edit-specific prompt with reviewer comments
+    if issue.state not in ["In Progress", "Edit"] do
       case Tracker.update_issue_state(issue.id, "In Progress") do
         :ok ->
           Logger.info("Moved #{issue_context(issue)} to In Progress")

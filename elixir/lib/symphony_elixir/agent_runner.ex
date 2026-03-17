@@ -77,6 +77,10 @@ defmodule SymphonyElixir.AgentRunner do
     # that includes reviewer comments and focuses on tweaks, not full implementation
     prompt = build_session_prompt(issue, opts)
 
+    # Debug: write the actual prompt to a file so we can inspect it
+    File.mkdir_p!(Path.join(workspace, ".symphony"))
+    File.write!(Path.join(workspace, ".symphony/last_prompt.txt"), prompt)
+
     on_event = build_event_handler(issue, orchestrator_pid)
 
     # For Edit state, resume the previous Claude session to preserve context
@@ -119,15 +123,18 @@ defmodule SymphonyElixir.AgentRunner do
 
   # -- Prompt building --
 
-  defp build_session_prompt(%Issue{state: "Edit"} = issue, opts) do
+  defp build_session_prompt(%Issue{state: state} = issue, opts) when state in ["Edit", "edit"] do
     # Edit state: fetch reviewer comments and build a focused edit prompt
+    Logger.info("BUILD EDIT PROMPT for #{issue.identifier} (state=#{state})")
     base_prompt = PromptBuilder.build_prompt(issue, opts)
     comments = fetch_reviewer_comments(issue)
+    Logger.info("Fetched #{length(comments)} reviewer comments for #{issue.identifier}")
 
     if comments == [] do
-      # No comments — fall back to standard prompt
+      Logger.warning("No reviewer comments found for #{issue.identifier} in Edit state, using base prompt")
       base_prompt
     else
+      Logger.info("Building edit prompt with #{length(comments)} comments")
       edit_prompt(issue, comments, base_prompt)
     end
   end
