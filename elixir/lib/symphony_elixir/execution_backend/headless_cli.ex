@@ -121,70 +121,45 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
   #   UserMessage — tool results
   #   ResultMessage — session complete
 
-  # -- Partial messages: only emit tool starts, skip text deltas --
-  # Text deltas cause massive duplication in the dashboard (every character
-  # chunk shows as a separate event). The full text arrives with AssistantMessage.
+  # -- Skip all partial/progress/summary messages --
+  # These fire multiple times per tool call and duplicate what
+  # AssistantMessage and UserMessage already provide cleanly.
+  defp message_to_events(%PartialAssistantMessage{}), do: []
+  defp message_to_events(%ToolProgressMessage{}), do: []
+  defp message_to_events(%ToolUseSummaryMessage{}), do: []
 
-  defp message_to_events(%PartialAssistantMessage{event: event} = _msg) do
-    case event do
-      # Tool use starting — useful to show "agent is now calling Read/Edit/Bash"
-      %{type: :content_block_start, content_block: %{type: :tool_use, name: name}} ->
-        [Event.tool_use(name, %{})]
+  # -- Complete assistant message: THE primary source of events --
+  # One per agent turn. Contains text reasoning + tool calls with full input.
+  defp message_to_events(%AssistantMessage{message: %{content: content, usage: usage}}) when is_list(content) do
+    events =
+      content
+      |> Enum.flat_map(fn
+        %TextBlock{text: text} when is_binary(text) ->
+          trimmed = String.trim(text)
+          if trimmed != "", do: [Event.assistant(trimmed)], else: []
 
-      %{"type" => "content_block_start", "content_block" => %{"type" => "tool_use", "name" => name}} ->
-        [Event.tool_use(name, %{})]
+        %ToolUseBlock{name: name, input: input} ->
+          [Event.tool_use(name, input || %{})]
 
-      # Skip all text deltas — full text comes with AssistantMessage
-      _ ->
-        []
-    end
-  end
+        _ ->
+          []
+      end)
 
-  # -- Tool progress --
-  defp message_to_events(%ToolProgressMessage{tool_name: name} = _msg) do
-    [Event.tool_use(name || "tool", %{})]
-  end
-
-  # -- Tool summary --
-  defp message_to_events(%ToolUseSummaryMessage{summary: summary} = _msg) when is_binary(summary) do
-    [Event.tool_result("tool", String.slice(summary, 0, 500), true)]
-  end
-
-  # -- Complete assistant message (uses parsed Content structs) --
-  defp message_to_events(%AssistantMessage{message: %{content: content, usage: usage}} = _msg) when is_list(content) do
-    events = Enum.flat_map(content, fn
-      %TextBlock{text: text} when is_binary(text) and text != "" ->
-        [Event.assistant(text)]
-
-      %ToolUseBlock{name: name, input: input} ->
-        [Event.tool_use(name, input || %{})]
-
-      %{type: :text, text: text} when is_binary(text) and text != "" ->
-        [Event.assistant(text)]
-
-      %{type: :tool_use, name: name, input: input} ->
-        [Event.tool_use(name, input || %{})]
-
-      _ ->
-        []
-    end)
-
-    # Attach usage data to the first event so the orchestrator can track tokens
+    # Attach usage to first event for token tracking
     case {events, usage} do
       {[first | rest], %{} = u} ->
-        first_with_usage = %{first | content: Map.put(first.content, :usage, u)}
-        [first_with_usage | rest]
-
+        [%{first | content: Map.put(first.content, :usage, u)} | rest]
       _ ->
         events
     end
   end
 
-  # Fallback when usage is nil
   defp message_to_events(%AssistantMessage{message: %{content: content}}) when is_list(content) do
-    Enum.flat_map(content, fn
-      %TextBlock{text: text} when is_binary(text) and text != "" ->
-        [Event.assistant(text)]
+    content
+    |> Enum.flat_map(fn
+      %TextBlock{text: text} when is_binary(text) ->
+        trimmed = String.trim(text)
+        if trimmed != "", do: [Event.assistant(trimmed)], else: []
 
       %ToolUseBlock{name: name, input: input} ->
         [Event.tool_use(name, input || %{})]
