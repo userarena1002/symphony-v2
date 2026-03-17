@@ -1193,12 +1193,16 @@ defmodule SymphonyElixir.Orchestrator do
     Map.put(entry, :cost_usd, cost)
   end
 
-  # Track cumulative tokens from assistant message usage data
+  # Accumulate tokens from assistant message usage data
   defp maybe_update_tokens(entry, %Event{type: :assistant, content: %{usage: usage}})
        when is_map(usage) do
     input = Map.get(usage, :input_tokens) || Map.get(usage, "input_tokens", 0)
     output = Map.get(usage, :output_tokens) || Map.get(usage, "output_tokens", 0)
-    Map.put(entry, :total_tokens, input + output)
+    cache_read = Map.get(usage, :cache_read_input_tokens, 0)
+    cache_create = Map.get(usage, :cache_creation_input_tokens, 0)
+    msg_tokens = input + output + cache_read + cache_create
+    existing = Map.get(entry, :total_tokens, 0)
+    Map.put(entry, :total_tokens, existing + msg_tokens)
   end
 
   defp maybe_update_tokens(entry, _event), do: entry
