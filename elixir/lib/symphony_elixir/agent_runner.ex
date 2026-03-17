@@ -79,9 +79,21 @@ defmodule SymphonyElixir.AgentRunner do
 
     on_event = build_event_handler(issue, orchestrator_pid)
 
+    # For Edit state, resume the previous Claude session to preserve context
+    resume_id = if issue.state == "Edit" do
+      HeadlessCLI.load_session_id(workspace)
+    else
+      nil
+    end
+
+    if resume_id do
+      Logger.info("Resuming session #{resume_id} for #{issue_context(issue)} (Edit mode)")
+    end
+
     cli_opts = [
       backend: config.agent.backend,
-      on_event: on_event
+      on_event: on_event,
+      resume_session_id: resume_id
     ]
 
     case HeadlessCLI.run_session(workspace, prompt, cli_opts) do

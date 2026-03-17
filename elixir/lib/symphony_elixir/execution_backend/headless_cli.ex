@@ -48,21 +48,38 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
 
   # -- Claude Code SDK execution --
 
-  defp run_claude_session(workspace, prompt, config, on_event, _opts) do
-    Logger.info("Starting Claude Code session in #{workspace}")
+  defp run_claude_session(workspace, prompt, config, on_event, opts) do
+    resume_session_id = Keyword.get(opts, :resume_session_id)
 
-    on_event.(Event.system(:init, %{workspace: workspace, backend: "claude"}))
+    if resume_session_id do
+      Logger.info("Resuming Claude Code session #{resume_session_id} in #{workspace}")
+    else
+      Logger.info("Starting new Claude Code session in #{workspace}")
+    end
 
+    on_event.(Event.system(:init, %{
+      workspace: workspace,
+      backend: "claude",
+      resuming: resume_session_id
+    }))
+
+    # Session-level options
     sdk_opts = [
       max_turns: config.agent.max_turns,
       cwd: workspace,
       dangerously_skip_permissions: true
     ]
 
+    # Add resume if we have a previous session ID
+    sdk_opts = if resume_session_id do
+      Keyword.put(sdk_opts, :resume, resume_session_id)
+    else
+      sdk_opts
+    end
+
     {:ok, session} = ClaudeCode.start_link(sdk_opts)
 
     try do
-      # Pass include_partial_messages at query level for real-time streaming
       query_opts = [include_partial_messages: true]
 
       {_last, final_sid} =
@@ -71,21 +88,16 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
         |> Enum.reduce({nil, nil}, fn msg, {_last, sid} ->
           new_sid = sid || extract_session_id(msg)
 
-          # Convert SDK message to Symphony events and emit in real-time
           events = message_to_events(msg)
-
-          # Debug: log message types that produce no events
-          if events == [] do
-            File.write!("/tmp/symphony-debug.log",
-              "NO_EVENTS: #{msg.__struct__ |> to_string() |> String.split(".") |> List.last()}\n", [:append])
-          end
-
           for event <- events do
             on_event.(%{event | session_id: new_sid})
           end
 
           {msg, new_sid}
         end)
+
+      # Save session ID to workspace for future resume
+      save_session_id(workspace, final_sid)
 
       on_event.(Event.system(:done, %{status: :success, session_id: final_sid}))
       {:ok, %{session_id: final_sid, status: :completed}}
@@ -249,6 +261,34 @@ defmodule SymphonyElixir.ExecutionBackend.HeadlessCLI do
 
   defp extract_session_id(%{session_id: id}) when is_binary(id), do: id
   defp extract_session_id(_msg), do: nil
+
+  # -- Session persistence --
+
+  @session_id_file ".symphony/last_session_id"
+
+  defp save_session_id(workspace, session_id) when is_binary(session_id) do
+    path = Path.join(workspace, @session_id_file)
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, session_id)
+    Logger.info("Saved session ID #{session_id} to #{path}")
+  end
+
+  defp save_session_id(_workspace, _session_id), do: :ok
+
+  @doc "Load the last session ID for a workspace, if one exists."
+  @spec load_session_id(Path.t()) :: String.t() | nil
+  def load_session_id(workspace) do
+    path = Path.join(workspace, @session_id_file)
+
+    case File.read(path) do
+      {:ok, id} ->
+        trimmed = String.trim(id)
+        if trimmed != "", do: trimmed, else: nil
+
+      {:error, _} ->
+        nil
+    end
+  end
 
   # -- Helpers --
 
