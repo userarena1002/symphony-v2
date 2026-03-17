@@ -27,6 +27,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:expanded, MapSet.new())
       |> assign(:agent_events, %{})
       |> assign(:subscribed_issues, MapSet.new())
+      |> assign(:completed_agents, [])
+      |> assign(:known_running_ids, MapSet.new())
 
     if connected?(socket) do
       :ok = ObservabilityPubSub.subscribe()
@@ -44,6 +46,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
     # Auto-subscribe to events for any running issues we haven't subscribed to yet
     socket = maybe_subscribe_running_issues(socket, payload)
+
+    # Detect agents that finished (were running, now aren't) and add to completed list
+    socket = track_completed_agents(socket, payload)
 
     {:noreply,
      socket
@@ -274,6 +279,34 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
           </section>
         <% end %>
+
+        <%!-- Completed / idle agents --%>
+        <%= if @completed_agents != [] do %>
+          <section class="section-card">
+            <div class="section-header">
+              <h2 class="section-title">Idle Agents</h2>
+              <p class="section-copy">Previously completed sessions from this runtime.</p>
+            </div>
+            <div class="agent-list">
+              <%= for entry <- @completed_agents do %>
+                <div class="agent-card agent-card-idle">
+                  <div class="agent-row">
+                    <div class="agent-row-main">
+                      <span class="agent-identifier"><%= entry.issue_identifier %></span>
+                      <span class="state-badge state-badge-idle">Completed</span>
+                    </div>
+                    <div class="agent-row-meta">
+                      <span class="agent-runtime numeric muted">
+                        <%= format_time_ago(entry.completed_at, @now) %> ago
+                      </span>
+                      <span class="agent-tokens numeric muted"><%= entry.event_count %> events</span>
+                    </div>
+                  </div>
+                </div>
+              <% end %>
+            </div>
+          </section>
+        <% end %>
       <% end %>
     </section>
     """
@@ -307,6 +340,54 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
       _ ->
         socket
+    end
+  end
+
+  defp track_completed_agents(socket, payload) do
+    current_running_ids =
+      case payload do
+        %{running: running} when is_list(running) ->
+          running |> Enum.map(& &1.issue_id) |> MapSet.new()
+        _ ->
+          MapSet.new()
+      end
+
+    prev_running_ids = socket.assigns.known_running_ids
+
+    # Find agents that were running but aren't anymore
+    finished_ids = MapSet.difference(prev_running_ids, current_running_ids)
+
+    completed_agents =
+      if MapSet.size(finished_ids) > 0 do
+        # Build completed entries from the events we captured
+        new_completed =
+          finished_ids
+          |> Enum.map(fn id ->
+            events = Map.get(socket.assigns.agent_events, id, [])
+            %{
+              issue_id: id,
+              issue_identifier: find_identifier(events, id),
+              completed_at: DateTime.utc_now(),
+              event_count: length(events)
+            }
+          end)
+
+        # Prepend new completions, keep last 20
+        Enum.take(new_completed ++ socket.assigns.completed_agents, 20)
+      else
+        socket.assigns.completed_agents
+      end
+
+    socket
+    |> assign(:completed_agents, completed_agents)
+    |> assign(:known_running_ids, current_running_ids)
+  end
+
+  defp find_identifier(events, fallback_id) do
+    # Try to find the identifier from event context, fall back to issue_id
+    case events do
+      [first | _] -> first.issue_id || fallback_id
+      _ -> fallback_id
     end
   end
 
@@ -357,6 +438,18 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp compact_session(nil), do: "pending"
   defp compact_session(id) when is_binary(id), do: String.slice(id, 0, 12) <> "..."
+
+  defp format_time_ago(%DateTime{} = completed, %DateTime{} = now) do
+    seconds = max(DateTime.diff(now, completed, :second), 0)
+
+    cond do
+      seconds < 60 -> "#{seconds}s"
+      seconds < 3600 -> "#{div(seconds, 60)}m"
+      true -> "#{div(seconds, 3600)}h #{div(rem(seconds, 3600), 60)}m"
+    end
+  end
+
+  defp format_time_ago(_, _), do: "?"
 
   defp format_event_time(%DateTime{} = dt) do
     Calendar.strftime(dt, "%H:%M:%S")
